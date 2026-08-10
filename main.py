@@ -33,32 +33,35 @@ def receive_signal(data: dict):
     return {"status": "success"}
 
 def fetch_binance_quant_data(symbol="BTCUSDT", interval="5m", limit=300):
-    url = f"https://api3.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    try:
-        res = requests.get(url, timeout=5).json()
-        if isinstance(res, list) and len(res) > 0:
-            df = pd.DataFrame(res, columns=[
-                'open_time', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_vol', 'taker_buy_quote_vol', 'ignore'
-            ])
-            # 🎯 Safety Fix 1: Ensure all column names are strictly lowercase
-            df.columns = [c.lower() for c in df.columns]
+    endpoints = [
+        f"https://api3.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    ]
+    
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5).json()
+            if isinstance(res, list) and len(res) > 0:
+                df = pd.DataFrame(res, columns=[
+                    'open_time', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_asset_volume', 'number_of_trades',
+                    'taker_buy_base_vol', 'taker_buy_quote_vol', 'ignore'
+                ])
+                df.columns = [c.lower() for c in df.columns]
+                cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_vol']
+                df[cols] = df[cols].astype(float)
+                df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+                return df
+        except Exception as e:
+            print(f"Fetch Error ({url}): {e}", flush=True)
             
-            cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_vol']
-            df[cols] = df[cols].astype(float)
-            df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-            return df
-    except Exception as e:
-        print(f"Fetch Error: {e}", flush=True)
     return pd.DataFrame()
 
 def build_institutional_features(df):
-    if df.empty or len(df) < 30:
+    if df is None or df.empty or 'close' not in df.columns or len(df) < 30:
         return pd.DataFrame()
+        
     df = df.copy()
-    
-    # 🎯 Safety Fix 2: Lowercase validation to eliminate KeyError: 'Close' forever
     df.columns = [c.lower() for c in df.columns]
 
     df['taker_sell_vol'] = df['volume'] - df['taker_buy_base_vol']
@@ -104,9 +107,11 @@ def build_institutional_features(df):
 
 def get_15m_htf_structure():
     df_15m = fetch_binance_quant_data(interval="15m", limit=100)
-    if df_15m.empty or len(df_15m) < 20:
+    if df_15m.empty or 'close' not in df_15m.columns or len(df_15m) < 20:
         return 0, 0.50
     df_15m = build_institutional_features(df_15m)
+    if df_15m.empty or 'close' not in df_15m.columns:
+        return 0, 0.50
     ema20 = df_15m['close'].ewm(span=20).mean().iloc[-1]
     curr_close = df_15m['close'].iloc[-1]
     trend = 1 if curr_close > ema20 else -1
@@ -115,10 +120,22 @@ def get_15m_htf_structure():
 
 def train_5m_quant_model():
     print("⏳ Training AI Model...", flush=True)
-    df = fetch_binance_quant_data(interval="5m", limit=500)
-    df = build_institutional_features(df)
+    df = pd.DataFrame()
+    
+    # Retry loop with safety check
+    while True:
+        raw_df = fetch_binance_quant_data(interval="5m", limit=500)
+        if not raw_df.empty and 'close' in raw_df.columns:
+            df = build_institutional_features(raw_df)
+            if not df.empty and 'close' in df.columns and len(df) >= 50:
+                break
+        print("⚠️ Data Fetching Issue. Retrying in 5s...", flush=True)
+        time.sleep(5)
+
     for col in FEATURE_COLUMNS:
-        if col not in df.columns: df[col] = 0.0
+        if col not in df.columns: 
+            df[col] = 0.0
+            
     future_return = (df['close'].shift(-3) - df['close']) / df['close']
     df['Target'] = np.where(future_return > 0.003, 1, 0)
     df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -137,56 +154,58 @@ def quant_execution_loop():
         try:
             htf_trend, htf_pd_zone = get_15m_htf_structure()
             live_df = fetch_binance_quant_data(interval="5m", limit=100)
-            if not live_df.empty and len(live_df) >= 30:
+            if not live_df.empty and 'close' in live_df.columns and len(live_df) >= 30:
                 live_df = build_institutional_features(live_df)
-                for col in FEATURE_COLUMNS:
-                    if col not in live_df.columns: live_df[col] = 0.0
-                
-                latest_features = live_df[FEATURE_COLUMNS].iloc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
-                prob = scalp_model_5m.predict_proba(latest_features)[0][1]
-                current_price = live_df['close'].iloc[-1]
-                delta = live_df['footprint_delta'].iloc[-1]
-                pd_zone_val = live_df['premium_discount_zone'].iloc[-1]
-                
-                est_side = "BUY" if htf_trend == 1 else "SELL"
-                t_price = live_df['high'].rolling(30).max().iloc[-1] if est_side == "BUY" else live_df['low'].rolling(30).min().iloc[-1]
-                
-                state_msg = "SEARCHING FOR ENTRY..."
-                if active_trade == "BUY":
-                    tot_dist = active_target_price - active_entry_price
-                    curr_dist = current_price - active_entry_price
-                    progress = (curr_dist / tot_dist) if tot_dist > 0 else 0
-                    if progress >= 1.0 or current_price >= active_target_price:
-                        state_msg = "🎉 100% FULL TARGET ACHIEVED!"; active_trade = None
-                    elif delta < -100 or prob < 0.40 or htf_trend == -1:
-                        state_msg = "🚨 EXIT NOW / INVALIDATED!"; active_trade = None
-                    elif progress >= 0.80: state_msg = "⚠️ TAKE PARTIAL PROFIT (80% Reached)!"
-                    elif progress >= 0.50: state_msg = "🎯 50% TARGET ACHIEVED!"
-                    elif progress >= 0.25: state_msg = "🎯 25% TARGET ACHIEVED!"
-                    else: state_msg = f"🟢 BUY ACTIVE ({progress*100:.1f}%)"
-                elif active_trade == "SELL":
-                    tot_dist = active_entry_price - active_target_price
-                    curr_dist = active_entry_price - current_price
-                    progress = (curr_dist / tot_dist) if tot_dist > 0 else 0
-                    if progress >= 1.0 or current_price <= active_target_price:
-                        state_msg = "🎉 100% FULL TARGET ACHIEVED!"; active_trade = None
-                    elif delta > 100 or prob > 0.60 or htf_trend == 1:
-                        state_msg = "🚨 EXIT NOW / INVALIDATED!"; active_trade = None
-                    elif progress >= 0.80: state_msg = "⚠️ TAKE PARTIAL PROFIT (80% Reached)!"
-                    elif progress >= 0.50: state_msg = "🎯 50% TARGET ACHIEVED!"
-                    elif progress >= 0.25: state_msg = "🎯 25% TARGET ACHIEVED!"
-                    else: state_msg = f"🔴 SELL ACTIVE ({progress*100:.1f}%)"
+                if not live_df.empty and 'close' in live_df.columns:
+                    for col in FEATURE_COLUMNS:
+                        if col not in live_df.columns: 
+                            live_df[col] = 0.0
+                    
+                    latest_features = live_df[FEATURE_COLUMNS].iloc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
+                    prob = scalp_model_5m.predict_proba(latest_features)[0][1]
+                    current_price = live_df['close'].iloc[-1]
+                    delta = live_df['footprint_delta'].iloc[-1]
+                    pd_zone_val = live_df['premium_discount_zone'].iloc[-1]
+                    
+                    est_side = "BUY" if htf_trend == 1 else "SELL"
+                    t_price = live_df['high'].rolling(30).max().iloc[-1] if est_side == "BUY" else live_df['low'].rolling(30).min().iloc[-1]
+                    
+                    state_msg = "SEARCHING FOR ENTRY..."
+                    if active_trade == "BUY":
+                        tot_dist = active_target_price - active_entry_price
+                        curr_dist = current_price - active_entry_price
+                        progress = (curr_dist / tot_dist) if tot_dist > 0 else 0
+                        if progress >= 1.0 or current_price >= active_target_price:
+                            state_msg = "🎉 100% FULL TARGET ACHIEVED!"; active_trade = None
+                        elif delta < -100 or prob < 0.40 or htf_trend == -1:
+                            state_msg = "🚨 EXIT NOW / INVALIDATED!"; active_trade = None
+                        elif progress >= 0.80: state_msg = "⚠️ TAKE PARTIAL PROFIT (80% Reached)!"
+                        elif progress >= 0.50: state_msg = "🎯 50% TARGET ACHIEVED!"
+                        elif progress >= 0.25: state_msg = "🎯 25% TARGET ACHIEVED!"
+                        else: state_msg = f"🟢 BUY ACTIVE ({progress*100:.1f}%)"
+                    elif active_trade == "SELL":
+                        tot_dist = active_entry_price - active_target_price
+                        curr_dist = active_entry_price - current_price
+                        progress = (curr_dist / tot_dist) if tot_dist > 0 else 0
+                        if progress >= 1.0 or current_price <= active_target_price:
+                            state_msg = "🎉 100% FULL TARGET ACHIEVED!"; active_trade = None
+                        elif delta > 100 or prob > 0.60 or htf_trend == 1:
+                            state_msg = "🚨 EXIT NOW / INVALIDATED!"; active_trade = None
+                        elif progress >= 0.80: state_msg = "⚠️ TAKE PARTIAL PROFIT (80% Reached)!"
+                        elif progress >= 0.50: state_msg = "🎯 50% TARGET ACHIEVED!"
+                        elif progress >= 0.25: state_msg = "🎯 25% TARGET ACHIEVED!"
+                        else: state_msg = f"🔴 SELL ACTIVE ({progress*100:.1f}%)"
 
-                # Check Signal Triggers
-                if prob > 0.65 and pd_zone_val < 0.50 and htf_trend == 1 and active_trade != "BUY":
-                    active_trade, active_entry_price, active_target_price = "BUY", current_price, t_price
-                    print(f"🔥 BUY TRIGGERED @ ${current_price}", flush=True)
-                elif prob < 0.35 and pd_zone_val > 0.50 and htf_trend == -1 and active_trade != "SELL":
-                    active_trade, active_entry_price, active_target_price = "SELL", current_price, t_price
-                    print(f"🔻 SELL TRIGGERED @ ${current_price}", flush=True)
+                    # Check Signal Triggers
+                    if prob > 0.65 and pd_zone_val < 0.50 and htf_trend == 1 and active_trade != "BUY":
+                        active_trade, active_entry_price, active_target_price = "BUY", current_price, t_price
+                        print(f"🔥 BUY TRIGGERED @ ${current_price}", flush=True)
+                    elif prob < 0.35 and pd_zone_val > 0.50 and htf_trend == -1 and active_trade != "SELL":
+                        active_trade, active_entry_price, active_target_price = "SELL", current_price, t_price
+                        print(f"🔻 SELL TRIGGERED @ ${current_price}", flush=True)
 
-                latest_bot_state = f"BTC: ${current_price:.2f} | Target: ${t_price:.2f} | State: {state_msg}"
-                print(f"[LIVE LOG]: {latest_bot_state}", flush=True)
+                    latest_bot_state = f"BTC: ${current_price:.2f} | Target: ${t_price:.2f} | State: {state_msg}"
+                    print(f"[LIVE LOG]: {latest_bot_state}", flush=True)
 
             time.sleep(10)
         except Exception as e:
