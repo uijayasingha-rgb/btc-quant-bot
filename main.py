@@ -42,6 +42,9 @@ def fetch_binance_quant_data(symbol="BTCUSDT", interval="5m", limit=300):
                 'close_time', 'quote_asset_volume', 'number_of_trades',
                 'taker_buy_base_vol', 'taker_buy_quote_vol', 'ignore'
             ])
+            # 🎯 Safety Fix 1: Ensure all column names are strictly lowercase
+            df.columns = [c.lower() for c in df.columns]
+            
             cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_vol']
             df[cols] = df[cols].astype(float)
             df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
@@ -54,6 +57,10 @@ def build_institutional_features(df):
     if df.empty or len(df) < 30:
         return pd.DataFrame()
     df = df.copy()
+    
+    # 🎯 Safety Fix 2: Lowercase validation to eliminate KeyError: 'Close' forever
+    df.columns = [c.lower() for c in df.columns]
+
     df['taker_sell_vol'] = df['volume'] - df['taker_buy_base_vol']
     df['footprint_delta'] = df['taker_buy_base_vol'] - df['taker_sell_vol']
     df['cvd'] = df['footprint_delta'].cumsum()
