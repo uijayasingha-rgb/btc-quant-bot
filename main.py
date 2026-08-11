@@ -223,6 +223,16 @@ def health_check():
         "engine_state": bot_state,
         "server_time": str(datetime.now())
     }
+@app.get("/signal")
+def get_latest_signal():
+    """TradingView Connector Endpoint"""
+    return {
+        "symbol": bot_state["symbol"],
+        "price": bot_state["last_price"],
+        "signal": bot_state["last_signal"],
+        "timestamp": bot_state["last_update"]
+    }
+    
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)
