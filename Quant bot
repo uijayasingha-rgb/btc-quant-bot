@@ -1,5 +1,0 @@
-candidates: List[SwingCandidate] = []
-for i in range(left, len(marked) - right):
-    swing_type = None
-    # ... ඉතිරි කොටස ...
-return candidates 
