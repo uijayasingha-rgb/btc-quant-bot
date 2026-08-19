@@ -9,6 +9,9 @@ import logging
 import os
 import math
 import time
+import threading
+import queue
+import copy
 import html
 import pickle
 from datetime import datetime, timedelta
@@ -22,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from pydantic import BaseModel, Field
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -136,8 +140,10 @@ except ImportError:
 try:
     from mt5.connector import MT5Connector
     mt5 = MT5Connector()
-except ImportError:
-    class _FakeMT5:
+except ImportError as e:
+    print(f"❌ CRITICAL: mt5.connector module not found: {e}")
+    print("🔒 Exiting because real MT5 connector is required.")
+    raise SystemExit(1)
         def connect(self, *a, **k): return False
         def get_balance(self): return 15.0
         def fetch_rates(self, *a, **k): return pd.DataFrame()
@@ -228,6 +234,91 @@ class BotState:
 
 state = BotState()
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# THREAD-SAFE INFRASTRUCTURE
+# ═══════════════════════════════════════════════════════════════════════
+
+# 1. Main thread → Trading thread commands
+_trading_cmd_queue: queue.Queue = queue.Queue()
+
+# 2. Trading thread → Main thread notifications (sync queue)
+_notify_queue_sync: queue.Queue = queue.Queue()
+
+# 3. State snapshot lock & storage
+_state_lock = threading.Lock()
+_state_snapshot: Dict[str, Any] = {}
+
+def _publish_state_snapshot():
+    """Trading thread calls this at the end of every cycle"""
+    global _state_snapshot
+    with _state_lock:
+        # Active trade PnL (MT5 call safe — runs in trading thread)
+        active_trade_pnl = 0.0
+        if state.active_trade:
+            try:
+                pnl = mt5.get_position_profit(state.active_trade["ticket"])
+                active_trade_pnl = pnl if pnl is not None else 0.0
+            except Exception:
+                active_trade_pnl = 0.0
+
+        _state_snapshot = {
+            "auto_trading": state.auto_trading,
+            "balance": state.balance,
+            "equity": state.equity,
+            "free_margin": state.free_margin,
+            "mode": state.mode,
+            "symbol": state.current_symbol,
+            "session": state.session,
+            "daily_trades": state.daily_trades,
+            "daily_wins": state.daily_wins,
+            "daily_losses": state.daily_losses,
+            "daily_be": state.daily_be,
+            "win_rate": round((state.daily_wins / max(state.daily_wins + state.daily_losses + state.daily_be, 1)) * 100, 1),
+            "avg_r": round(state.total_r / max(len(state.trade_history), 1), 2),
+            "total_r": state.total_r,
+            "max_drawdown": state.max_drawdown,
+            "current_daily_dd": calculate_daily_drawdown(),
+            "daily_peak": state.daily_peak,
+            "daily_starting_balance": state.daily_starting_balance,
+            "last_reset_date": state.last_reset_date,
+            "session_trades": dict(state.session_trades),
+            "current_spread": state.current_spread,
+            "mt5_connected": state.mt5_connected,
+            "mt5_status_text": "CONNECTED" if state.mt5_connected else "DISCONNECTED",
+            "daily_trading_halted": state.daily_trading_halted,
+            "daily_halt_reason": state.daily_halt_reason,
+            "consecutive_losses": state.consecutive_losses,
+            "ml_model_ready": state.ml_model_ready,
+            "last_ml_train_time": state.last_ml_train_time,
+            "active_trade": copy.deepcopy(state.active_trade),
+            "open_trades": list(copy.deepcopy(t) for t in state.open_trades.values()),
+            "open_trade_count": len(state.open_trades),
+            "active_trade_pnl": round(active_trade_pnl, 2),
+            "equity_curve": list(state.equity_curve)[-50:],
+            "trade_recovered": state.trade_recovered,
+            "last_decision": state.last_score.get("decision", "NO SETUP") if state.last_score else "NO SETUP",
+            "last_prob_long": state.last_score.get("long_prob", 0) if state.last_score else 0,
+            "last_prob_short": state.last_score.get("short_prob", 0) if state.last_score else 0,
+            "max_daily_trades": settings.MAX_DAILY_TRADES,
+            "news_blocked": False,
+            "news_reason": "",
+            "news_event": None,
+            "news_today": get_today_news(),
+            "spread_limit": get_spread_limit(state.current_symbol),
+            "spread_limit_gold": getattr(settings, 'SPREAD_LIMIT_GOLD', 5.0),
+            "spread_limit_btc": getattr(settings, 'SPREAD_LIMIT_BTC', 50.0),
+            "spread_blocked": False,
+        }
+
+def get_state_snapshot() -> Dict[str, Any]:
+    """FastAPI endpoints call this — non-blocking read"""
+    with _state_lock:
+        return copy.deepcopy(_state_snapshot)
+
+def notify_from_trading_thread(message: str):
+    """Trading thread එකේදී notify() call කිරීමට. asyncio.create_task() වෙනුවට මේක use කරන්න."""
+    _notify_queue_sync.put(message)
 app = FastAPI(title="SMC Quant Engine v4.1", version="4.1.0")
 # app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -554,6 +645,18 @@ def detect_bos_choch(df: pd.DataFrame, use_sweep_reclaim: bool = True) -> Tuple[
 def build_smc_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 30:
         return df
+# Ensure df.index is datetime (required for session-anchored VWAP)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if 'time' in df.columns:
+            df['time'] = pd.to_datetime(df['time'])
+            df = df.set_index('time')
+        else:
+            try:
+                df.index = pd.to_datetime(df.index)
+            except Exception:
+                df = df.reset_index(drop=True)
+                df.index = pd.date_range(end=datetime.now(), periods=len(df), freq='5min')
+
     df = df.copy()
     required = {"Open", "High", "Low", "Close", "Volume"}
     if not required.issubset(set(df.columns)):
@@ -625,18 +728,28 @@ def build_smc_features(df: pd.DataFrame) -> pd.DataFrame:
             return poc, vah, val
         except Exception:
             return 0.0, 0.0, 0.0
-    df['vp_poc'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[0], raw=False).ffill().fillna(0.0)
-    df['vp_vah'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[1], raw=False).ffill().fillna(0.0)
-    df['vp_val'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[2], raw=False).ffill().fillna(0.0)
-    df['pv'] = df['Close'] * df['Volume']
-    df['vwap'] = df['pv'].cumsum() / df['Volume'].cumsum().clip(lower=1e-8)
-    vwap_std = df['Close'].expanding().std().fillna(0.0)
-    df['vwap_std'] = vwap_std
-    df['vwap_dev'] = (df['Close'] - df['vwap']) / vwap_std.clip(lower=1e-8)
-    df['vwap_upper_1'] = df['vwap'] + vwap_std
-    df['vwap_lower_1'] = df['vwap'] - vwap_std
-    df['vwap_upper_2'] = df['vwap'] + 2 * vwap_std
-    df['vwap_lower_2'] = df['vwap'] - 2 * vwap_std
+    df['vp_poc'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[0], raw=True).ffill().fillna(0.0)
+    df['vp_vah'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[1], raw=True).ffill().fillna(0.0)
+    df['vp_val'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[2], raw=True).ffill().fillna(0.0)
+# ── Anchored VWAP + Bands (session/day) ──
+df['date_key'] = pd.to_datetime(df.index).strftime('%Y-%m-%d')  # index datetime
+# Cumulative PV & volume per session
+df['pv'] = df['Close'] * df['Volume']
+df['session_pv'] = df.groupby('date_key')['pv'].cumsum()
+df['session_vol'] = df.groupby('date_key')['Volume'].cumsum()
+df['vwap'] = df['session_pv'] / df['session_vol'].clip(lower=1e-8)
+
+# Price deviation from VWAP
+df['vwap_deviation'] = df['Close'] - df['vwap']
+
+# Rolling standard deviation of deviation (e.g., 48 periods)
+df['vwap_std'] = df.groupby('date_key')['vwap_deviation'].rolling(48, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
+
+df['vwap_dev'] = df['vwap_deviation'] / df['vwap_std'].clip(lower=1e-8)
+df['vwap_upper_1'] = df['vwap'] + df['vwap_std']
+df['vwap_lower_1'] = df['vwap'] - df['vwap_std']
+df['vwap_upper_2'] = df['vwap'] + 2 * df['vwap_std']
+df['vwap_lower_2'] = df['vwap'] - 2 * df['vwap_std']
     pd_window = 30
     df['range_high'] = df['High'].rolling(pd_window).max()
     df['range_low'] = df['Low'].rolling(pd_window).min()
@@ -1077,14 +1190,24 @@ def evaluate_entry(htf_df: pd.DataFrame, itf_df: pd.DataFrame, ltf_df: pd.DataFr
     result = ScoreResult()
     if ltf_df.empty or htf_df.empty:
         return result
+
     htf_structure, _ = detect_bos_choch(htf_df)
     ltf_structure, _ = detect_bos_choch(ltf_df)
+    # ITF structure (1H) — intermediate trend confirmation
+    if itf_df is not None and not itf_df.empty:
+        itf_structure, _ = detect_bos_choch(itf_df)
+    else:
+        itf_structure = Structure.NEUTRAL
+
     htf_bullish = htf_structure in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH)
     htf_bearish = htf_structure in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH)
     ltf_bullish = ltf_structure in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH)
     ltf_bearish = ltf_structure in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH)
     ltf_bull_bos = ltf_structure == Structure.BULLISH_BOS
     ltf_bear_bos = ltf_structure == Structure.BEARISH_BOS
+    itf_bullish = itf_structure in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH)
+    itf_bearish = itf_structure in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH)
+
     current_price = float(ltf_df['Close'].iloc[-1])
     pd_zone = _get_col(ltf_df, 'pd_zone', 0.5)
     fvg_bull = bool(ltf_df.iloc[-1].get('fvg_bull', False)) and not bool(ltf_df.iloc[-1].get('fvg_bull_filled', True))
@@ -1103,9 +1226,13 @@ def evaluate_entry(htf_df: pd.DataFrame, itf_df: pd.DataFrame, ltf_df: pd.DataFr
 
     long_score = 0.0
     long_details = {}
+
     if htf_bullish:
         long_score += 20
         long_details['htf_bias'] = '+20'
+    if itf_bullish:
+        long_score += 10
+        long_details['itf_bias'] = '+10'
     if pd_zone < 0.30:
         long_score += 15
         long_details['pd_zone'] = '+15'
@@ -1152,9 +1279,13 @@ def evaluate_entry(htf_df: pd.DataFrame, itf_df: pd.DataFrame, ltf_df: pd.DataFr
 
     short_score = 0.0
     short_details = {}
+
     if htf_bearish:
         short_score += 20
         short_details['htf_bias'] = '+20'
+    if itf_bearish:
+        short_score += 10
+        short_details['itf_bias'] = '+10'
     if pd_zone > 0.70:
         short_score += 15
         short_details['pd_zone'] = '+15'
@@ -1199,8 +1330,8 @@ def evaluate_entry(htf_df: pd.DataFrame, itf_df: pd.DataFrame, ltf_df: pd.DataFr
         (current_price < vwap and vp_val > 0 and current_price < vp_val),
     ])
 
-    long_prob = long_score / 100.0
-    short_prob = short_score / 100.0
+    long_prob = long_score / 110.0
+    short_prob = short_score / 110.0
     current_session = detect_session()
     buy_thresh, sell_thresh = get_session_thresholds(current_session, asian_auto_elevate)
     short_thresh = 1.0 - sell_thresh
@@ -1220,6 +1351,7 @@ def evaluate_entry(htf_df: pd.DataFrame, itf_df: pd.DataFrame, ltf_df: pd.DataFr
         "short": short_details,
         "htf_structure": htf_structure.value,
         "ltf_structure": ltf_structure.value,
+        "itf_structure": itf_structure.value,
         "pd_zone": round(pd_zone, 2),
         "session": current_session.value,
         "buy_threshold": buy_thresh,
@@ -1883,19 +2015,6 @@ def blend_score_with_ml(score_result: ScoreResult, ltf_df: pd.DataFrame) -> Scor
         score_result.decision = "SELL"
     score_result.details["final_decision_after_ml"] = score_result.decision
     return score_result
-
-async def ml_retrain_loop():
-    while state.running:
-        try:
-            if getattr(settings, 'ENABLE_ML_ENGINE', True) and XGBOOST_AVAILABLE:
-                symbol = get_symbol_for_datetime(datetime.now())
-                df = fetch_and_build(symbol, "5M", 500)
-                if not df.empty:
-                    ml_engine.train(df, symbol)
-        except Exception as e:
-            logger.error(f"ML retrain loop error: {e}")
-        await asyncio.sleep(getattr(settings, 'ML_RETRAIN_HOURS', 6) * 3600)
-
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 10: NOTIFICATION SYSTEM
 # ═══════════════════════════════════════════════════════════════════════
@@ -1954,6 +2073,17 @@ async def notify(message: str):
     for res in results:
         if isinstance(res, Exception):
             logger.warning(f"Notify error: {res}")
+async def _notification_bridge():
+    """Main event loop එකේ run වෙනවා. Trading thread එකේ messages deliver කරනවා."""
+    while state.running or not _notify_queue_sync.empty():
+        try:
+            msg = _notify_queue_sync.get_nowait()
+            if isinstance(msg, str):
+                await notify(msg)
+        except queue.Empty:
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Notification bridge error: {e}")
 
 def format_entry_alert(plan: TradePlan, symbol: str, score: ScoreResult, session: str) -> str:
     return (f"🎯 <b>ENTRY</b> | {symbol} {plan.direction}\n"
@@ -2162,6 +2292,13 @@ def check_htf_structure_break_exit(trade: Dict, htf_df: pd.DataFrame) -> bool:
     if htf_df.empty:
         return False
     htf_structure, _ = detect_bos_choch(htf_df)
+
+    if trade["direction"] == "BUY":
+        return htf_structure in (Structure.BEARISH_CHOCH, Structure.BEARISH_BOS)
+    elif trade["direction"] == "SELL":
+        return htf_structure in (Structure.BULLISH_CHOCH, Structure.BULLISH_BOS)
+    return False
+    htf_structure, _ = detect_bos_choch(htf_df)
     if trade["direction"] == "BUY" and htf_structure == Structure.BEARISH_CHOCH:
         return True
     if trade["direction"] == "SELL" and htf_structure == Structure.BULLISH_CHOCH:
@@ -2261,10 +2398,7 @@ def record_closed_trade(trade: Dict, exit_price: float, reason: str, realized_pn
     else:
         state.daily_be += 1; state.consecutive_losses = 0
     logger.info(f"📒 TRADE CLOSED | {record['direction']} {record['symbol']} | R:{r_multiple:+.2f} | PnL:${float(realized_pnl):+.2f} | Reason:{reason}")
-    try:
-        asyncio.create_task(notify(format_exit_alert(trade, exit_price, r_multiple, float(realized_pnl), reason)))
-    except RuntimeError:
-        pass
+    notify_from_trading_thread(format_exit_alert(trade, exit_price, r_multiple, float(realized_pnl), reason))
 
 def _remove_trade(ticket: int):
     state.open_trades.pop(str(ticket), None)
@@ -2301,32 +2435,54 @@ def _manage_one_trade(trade: Dict, ltf_df: pd.DataFrame, htf_df: pd.DataFrame):
     apply_breakeven(trade, current_r)
     apply_trailing_stop(trade, ltf_df, current_r)
 
-def manage_active_trade(ltf_df: pd.DataFrame, htf_df: pd.DataFrame):
+def manage_active_trade():
+    """Manage all open trades, fetching LTF/HTF data per symbol."""
     if not state.open_trades and state.active_trade:
         state.open_trades[str(state.active_trade["ticket"])] = state.active_trade
-    broker_trades = sync_open_positions_from_broker()
-    broker_tickets = {str(t["ticket"]) for t in broker_trades}
-    for trade in list(state.open_trades.values()):
-        if str(trade["ticket"]) in broker_tickets:
-            _manage_one_trade(trade, ltf_df, htf_df)
-    for ticket, trade in list(state.open_trades.items()):
-        if ticket not in broker_tickets:
-            logger.warning(f"♻️ BROKER CLOSED POSITION DETECTED | ticket:{ticket}; attempting history deal fetch")
-            closed_records = fetch_mt5_history_deals(symbol=trade.get('symbol'), since=datetime.now() - timedelta(days=1))
-            found = None
-            for deal in closed_records:
-                if int(_field(deal, 'ticket', default=-1)) == int(ticket):
-                    found = deal
-                    break
-            if found:
-                exit_price = float(_field(found, 'price', 'price_close', default=trade.get('entry', 0)) or trade.get('entry', 0))
-                pnl = float(_field(found, 'profit', 'pnl', default=None) or 0.0)
-                record_closed_trade(trade, exit_price, "BROKER_CLOSED", realized_pnl=pnl)
+
+    # Group open trades by symbol
+    trades_by_symbol: Dict[str, List[Dict]] = {}
+    for trade in state.open_trades.values():
+        symbol = trade.get("symbol", state.current_symbol)
+        trades_by_symbol.setdefault(symbol, []).append(trade)
+
+    for symbol, trades in trades_by_symbol.items():
+        if not trades:
+            continue
+
+        # Fetch data for this specific symbol
+        htf_df, itf_df, ltf_df = get_multi_timeframe_data(symbol)
+        if ltf_df.empty or htf_df.empty:
+            logger.warning(f"⚠️ Data empty for {symbol}; skip managing {len(trades)} trades")
+            continue
+
+        for trade in trades:
+            if _position_exists(int(trade["ticket"])):
+                _manage_one_trade(trade, ltf_df, htf_df)
             else:
-                logger.warning(f"No history deal found for ticket {ticket}; removing local state without PnL record")
-                state.open_trades.pop(ticket, None)
-            _remove_trade(int(ticket))
+                # Broker closed position
+                logger.warning(f"♻️ BROKER CLOSED POSITION DETECTED | ticket:{trade['ticket']}")
+                closed_records = fetch_mt5_history_deals(
+                    symbol=symbol,
+                    since=datetime.now() - timedelta(days=1)
+                )
+                found = None
+                for deal in closed_records:
+                    if int(_field(deal, 'ticket', default=-1)) == int(trade['ticket']):
+                        found = deal
+                        break
+
+                if found:
+                    exit_price = float(_field(found, 'price', 'price_close', default=trade.get('entry', 0)) or trade.get('entry', 0))
+                    pnl = float(_field(found, 'profit', 'pnl', default=None) or 0.0)
+                    record_closed_trade(trade, exit_price, "BROKER_CLOSED", realized_pnl=pnl)
+                else:
+                    state.open_trades.pop(str(trade['ticket']), None)
+
+                _remove_trade(int(trade['ticket']))
+
     state.active_trade = next(iter(state.open_trades.values()), None)
+    state.runner_trade = next((t for t in state.open_trades.values() if t.get("magic") == MAGIC_SPLIT_2), None)
     save_trade_state()
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2340,10 +2496,7 @@ def check_drawdown_protection() -> bool:
             state.daily_trading_halted = True
             state.daily_halt_reason = f"Daily equity DD limit hit ({daily_dd:.2f}%)"
             logger.critical(f"🔒 DAILY EQUITY DD LIMIT | {daily_dd:.2f}% — trading halted for day")
-            try:
-                asyncio.create_task(notify(f"🔒 *DAILY EQUITY DD LIMIT* | {daily_dd:.2f}% — trading halted"))
-            except RuntimeError:
-                pass
+            notify_from_trading_thread(f"🔒 *DAILY EQUITY DD LIMIT* | {daily_dd:.2f}% — trading halted")
         return False
     max_loss_amount = float(getattr(settings, "DAILY_MAX_LOSS_AMOUNT", 0.0) or 0.0)
     if max_loss_amount > 0:
@@ -2353,10 +2506,7 @@ def check_drawdown_protection() -> bool:
                 state.daily_trading_halted = True
                 state.daily_halt_reason = f"Daily max loss amount hit (${daily_loss_dollar:.2f})"
                 logger.critical(f"🔒 DAILY MAX LOSS AMOUNT | ${daily_loss_dollar:.2f} — trading halted")
-                try:
-                    asyncio.create_task(notify(f"🔒 *DAILY MAX LOSS AMOUNT* | ${daily_loss_dollar:.2f} — trading halted"))
-                except RuntimeError:
-                    pass
+                notify_from_trading_thread(f"🔒 *DAILY MAX LOSS AMOUNT* | ${daily_loss_dollar:.2f} — trading halted")
             return False
     return True
 
@@ -2411,10 +2561,7 @@ def check_risk_of_ruin_protection() -> bool:
             state.daily_trading_halted = True
             state.daily_halt_reason = f"Balance below minimum viable ({state.balance:.2f} < {min_balance:.2f})"
             logger.critical(f"🔒 RISK OF RUIN | Balance ${state.balance:.2f} below min ${min_balance:.2f}")
-            try:
-                asyncio.create_task(notify(f"🔒 *RISK OF RUIN* | Balance too low"))
-            except RuntimeError:
-                pass
+            notify_from_trading_thread(f"🔒 *RISK OF RUIN* | Balance too low")
         return False
     return True
 
@@ -2502,6 +2649,98 @@ def check_retreat_reentry(score: ScoreResult, ltf_df: pd.DataFrame, htf_df: pd.D
     plan = TradePlan(valid=True, direction=direction, entry=current_price, sl=sl, tp=tp,
                      position_size=position_size, rr_ratio=round(rr, 2), actual_risk=round(actual_risk, 2))
     return plan
+
+# ═══════════════════════════════════════════════════════════════════════
+# PYDANTIC SCHEMAS FOR API VALIDATION
+# ═══════════════════════════════════════════════════════════════════════
+class SettingsUpdate(BaseModel):
+    # Account/MT5
+    EXNESS_ACCOUNT_ID: Optional[int] = None
+    EXNESS_PASSWORD: Optional[str] = None
+    EXNESS_SERVER: Optional[str] = None
+    PRIMARY_SYMBOL: Optional[str] = None
+
+    # Risk
+    RISK_PER_TRADE_PCT: Optional[float] = None
+    MIN_RR_RATIO: Optional[float] = None
+    MAX_RISK_PER_TRADE_PCT: Optional[float] = None
+    MIN_FREE_MARGIN_BUFFER_PCT: Optional[float] = None
+    MAX_SLIPPAGE_POINTS: Optional[int] = None
+
+    # Daily / Session Limits
+    MAX_DAILY_TRADES: Optional[int] = None
+    MAX_TRADES_PER_SESSION: Optional[int] = None
+    ENABLE_SESSION_LIMITS: Optional[bool] = None
+    ENABLE_ASIAN_SESSION: Optional[bool] = None
+    ENABLE_LONDON_SESSION: Optional[bool] = None
+    ENABLE_NEWYORK_SESSION: Optional[bool] = None
+    ASIAN_AUTO_ELEVATE: Optional[bool] = None
+
+    # News
+    NEWS_PROTECTION: Optional[bool] = None
+    PRE_NEWS_MINUTES: Optional[int] = None
+    NEWS_FREEZE_MINUTES: Optional[int] = None
+
+    # Drawdown / Loss
+    DAILY_MAX_DRAWDOWN_PCT: Optional[float] = None
+    SESSION_MAX_DRAWDOWN_PCT: Optional[float] = None
+    CONSECUTIVE_LOSS_LIMIT: Optional[int] = None
+    DAILY_MAX_LOSS_AMOUNT: Optional[float] = None
+    MIN_VIABLE_BALANCE: Optional[float] = None
+
+    # Spread
+    SPREAD_LIMIT_GOLD: Optional[float] = None
+    SPREAD_LIMIT_BTC: Optional[float] = None
+    ALLOW_UNVERIFIED_SPREAD: Optional[bool] = None
+
+    # Server / Network
+    HOST: Optional[str] = None
+    PORT: Optional[int] = None
+
+    # Notifications
+    ENABLE_TELEGRAM_ALERTS: Optional[bool] = None
+    ENABLE_DISCORD_ALERTS: Optional[bool] = None
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
+    TELEGRAM_CHAT_ID: Optional[str] = None
+    DISCORD_WEBHOOK_URL: Optional[str] = None
+
+    # ML / Strategy
+    ENABLE_ML_ENGINE: Optional[bool] = None
+    ML_RETRAIN_HOURS: Optional[int] = None
+    ML_MIN_SAMPLES: Optional[int] = None
+    ML_WEIGHT: Optional[float] = None
+    RULE_WEIGHT: Optional[float] = None
+    ML_ENSEMBLE_WEIGHTS: Optional[Dict[str, float]] = None
+    MODEL_CALIBRATION: Optional[str] = None
+    TRIPLE_BARRIER_HORIZON: Optional[int] = None
+    TRIPLE_BARRIER_ATR_MULT: Optional[float] = None
+    FRACTIONAL_DIFF_D: Optional[float] = None
+
+    # Advanced / Misc
+    VOLATILITY_FILTER: Optional[bool] = None
+    MARKET_REGIME_DETECT: Optional[bool] = None
+    DXY_CORRELATION: Optional[bool] = None
+    MODE_SWITCH_BALANCE: Optional[float] = None
+    LOOP_INTERVAL_SECONDS: Optional[int] = None
+    MARKET_TIMEZONE_OFFSET: Optional[int] = None
+    ENABLE_TICK_DATA: Optional[bool] = None
+    ORDERBOOK_DEPTH: Optional[int] = None
+    DATA_BARS: Optional[int] = None
+    ADX_TREND_THRESHOLD: Optional[float] = None
+    VOLATILITY_FILTER_PERCENTILE: Optional[float] = None
+    MAX_SCALE_INS: Optional[int] = None
+    DXY_SYMBOL: Optional[str] = None
+    DXY_TIMEFRAME: Optional[str] = None
+    ENABLE_PHASE11A_SCAN: Optional[bool] = None
+    USE_FAKE_MT5: Optional[bool] = None
+
+    class Config:
+        extra = "ignore"   # Unknown fields ignore කරන්න (strict ඕන නම් "forbid")
+
+
+class WebhookPayload(BaseModel):
+    action: Optional[str] = None
+    balance: Optional[float] = None
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 14: DASHBOARD & API ENDPOINTS
@@ -2789,12 +3028,14 @@ setInterval(loadChart, 10000);
 </body>
 </html>
 """
+import hmac
+
 def _admin_authorized(request: Request) -> bool:
     key = str(getattr(settings, "ADMIN_API_KEY", "") or "")
     if not key:
         return not bool(getattr(settings, "REQUIRE_ADMIN_AUTH", False))
     supplied = request.headers.get("X-API-Key", "")
-    return supplied == key
+    return hmac.compare_digest(supplied, key)
 
 def _webhook_authorized(request: Request) -> bool:
     key = str(getattr(settings, "ADMIN_API_KEY", "") or "")
@@ -2812,73 +3053,7 @@ async def health():
 
 @app.get("/api/status")
 async def api_status():
-    total_closed = state.daily_wins + state.daily_losses + state.daily_be
-    win_rate = (state.daily_wins / max(total_closed, 1)) * 100
-    avg_r = state.total_r / max(len(state.trade_history), 1)
-    unrealized_pnl = 0.0
-    if state.active_trade:
-        try:
-            p = mt5.get_position_profit(state.active_trade["ticket"])
-            unrealized_pnl = p if p is not None else 0.0
-        except: pass
-    current_dd = calculate_daily_drawdown()
-    state.mt5_connected = check_mt5_connection()
-    if state.auto_trading and not state.mt5_connected:
-        state.auto_trading = False
-        logger.critical("🔒 SAFETY KILL | Auto trading disabled — MT5 connection lost")
-    news_status = {"blocked": False}
-    if settings.NEWS_PROTECTION:
-        try:
-            news_status = news_mgr.check_news_window(settings.PRE_NEWS_MINUTES, settings.NEWS_FREEZE_MINUTES, state.current_symbol)
-        except: pass
-    spread_check = check_spread_filter(state.current_symbol)
-    return {
-        "auto_trading": state.auto_trading,
-        "balance": round(state.balance, 2),
-        "equity": round(state.equity, 2),
-        "free_margin": round(state.free_margin, 2),
-        "mode": state.mode,
-        "symbol": state.current_symbol,
-        "session": state.session,
-        "daily_trades": state.daily_trades,
-        "daily_wins": state.daily_wins,
-        "daily_losses": state.daily_losses,
-        "win_rate": round(win_rate, 1),
-        "avg_r": round(avg_r, 2),
-        "total_r": round(state.total_r, 2),
-        "max_drawdown": round(state.max_drawdown, 2),
-        "current_daily_dd": round(current_dd, 2),
-        "daily_peak": round(state.daily_peak, 2),
-        "daily_start": round(state.daily_starting_balance, 2),
-        "last_reset_date": state.last_reset_date,
-        "session_trades": state.session_trades,
-        "max_daily_trades": settings.MAX_DAILY_TRADES,
-        "news_blocked": news_status.get("blocked", False),
-        "news_reason": news_status.get("reason"),
-        "news_event": news_status.get("event", {}).get("title") if news_status.get("event") else None,
-        "news_today": get_today_news(),
-        "current_spread": round(state.current_spread, 2),
-        "spread_limit": spread_check["limit"],
-        "spread_limit_gold": getattr(settings, 'SPREAD_LIMIT_GOLD', 5.0),
-        "spread_limit_btc": getattr(settings, 'SPREAD_LIMIT_BTC', 50.0),
-        "spread_blocked": not spread_check["allowed"],
-        "mt5_connected": state.mt5_connected,
-        "mt5_status_text": "CONNECTED" if state.mt5_connected else "DISCONNECTED",
-        "last_decision": state.last_score.get("decision", "NO SETUP") if state.last_score else "NO SETUP",
-        "last_prob_long": state.last_score.get("long_prob", 0) if state.last_score else 0,
-        "last_prob_short": state.last_score.get("short_prob", 0) if state.last_score else 0,
-        "active_trade": state.active_trade,
-        "open_trades": list(state.open_trades.values()),
-        "open_trade_count": len(state.open_trades),
-        "active_trade_pnl": round(unrealized_pnl, 2),
-        "equity_curve": list(state.equity_curve)[-50:],
-        "trade_recovered": state.trade_recovered,
-        "daily_trading_halted": state.daily_trading_halted,
-        "daily_halt_reason": state.daily_halt_reason,
-        "consecutive_losses": state.consecutive_losses,
-        "ml_model_ready": state.ml_model_ready,
-        "last_ml_train_time": state.last_ml_train_time,
-    }
+    return get_state_snapshot()
 
 @app.get("/api/chart")
 async def api_chart(tf: str = "5M"):
@@ -3007,75 +3182,63 @@ async def api_settings():
         "market_regime_detect": getattr(settings, 'MARKET_REGIME_DETECT', True),
         "dxy_correlation": getattr(settings, 'DXY_CORRELATION', False),
     }
-
 @app.post("/api/settings")
-async def update_settings(payload: Dict[str, Any], request: Request):
+async def update_settings(payload: SettingsUpdate, request: Request):
     if not _admin_authorized(request):
         return {"error": "Unauthorized"}
-    for key, value in payload.items():
-        if hasattr(settings, key.upper()):
-            if key.upper() in ("RISK_PER_TRADE_PCT", "MAX_RISK_PER_TRADE_PCT",
-                               "DAILY_MAX_DRAWDOWN_PCT", "SESSION_MAX_DRAWDOWN_PCT") and float(value) < 0:
-                continue
-            setattr(settings, key.upper(), value)
-    return {"status": "updated"}
+
+    settings_dict = payload.dict(exclude_none=True)
+    _trading_cmd_queue.put({"action": "update_settings", "settings": settings_dict})
+    return {"status": "queued"}
 
 @app.post("/api/toggle-auto")
 async def toggle_auto(request: Request):
     if not _admin_authorized(request):
-        return {"auto_trading": state.auto_trading, "error": "Unauthorized", "mt5_connected": state.mt5_connected}
-    state.mt5_connected = check_mt5_connection()
-    if state.auto_trading:
-        state.auto_trading = False
-        logger.info("🛑 Auto Trading turned OFF by user")
-        return {"auto_trading": False, "mt5_connected": state.mt5_connected}
-    else:
-        if not state.mt5_connected:
-            logger.warning("⛔ TOGGLE REJECTED | MT5 not connected")
-            return {"auto_trading": False, "error": "MT5 not connected. Connect to MT5 first.", "mt5_connected": False}
-        state.auto_trading = True
-        logger.info("🟢 Auto Trading turned ON by user")
-        return {"auto_trading": True, "mt5_connected": state.mt5_connected}
+        return {"error": "Unauthorized"}
+
+    snap = get_state_snapshot()
+    new_val = not snap["auto_trading"]
+
+    # Auto ON කිරීමට MT5 connected විය යුතුයි
+    if new_val and not snap["mt5_connected"]:
+        return {
+            "auto_trading": False,
+            "error": "MT5 not connected. Connect to MT5 first.",
+            "mt5_connected": False,
+        }
+
+    _trading_cmd_queue.put({"action": "toggle_auto", "value": new_val})
+
+    return {
+        "auto_trading": new_val,
+        "mt5_connected": snap["mt5_connected"],
+        "status": "queued",
+    }
 
 @app.post("/api/reset-daily-halt")
 async def reset_daily_halt(request: Request):
     if not _admin_authorized(request):
         return {"error": "Unauthorized"}
-    state.daily_trading_halted = False
-    state.daily_halt_reason = ""
-    state.consecutive_loss_cooldown_until = None
-    logger.warning("🔓 DAILY HALT MANUALLY RESET by user")
-    return {"status": "reset", "daily_trading_halted": state.daily_trading_halted}
+    _trading_cmd_queue.put({"action": "reset_halt"})
+    return {"status": "queued"}
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(payload: WebhookPayload, request: Request):
     if not _webhook_authorized(request):
         return {"status": "rejected", "error": "Unauthorized"}
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    if "balance" in payload:
-        try:
-            state.balance = float(payload["balance"])
-            update_daily_peak()
-            update_trading_mode()
-            logger.info(f"💰 BALANCE UPDATED via webhook: ${state.balance:.2f}")
-        except (TypeError, ValueError):
-            pass
-    if payload.get("action") == "close_all" and state.active_trade:
-        close_mt5_position(state.active_trade["ticket"], "WEBHOOK_CLOSE")
-        state.active_trade = None
-        save_trade_state()
-    return {"status": "received", "balance": round(state.balance, 2)}
+
+    if payload.action == "close_all":
+        _trading_cmd_queue.put({"action": "close_all"})
+
+    return {"status": "received"}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            status = await api_status()
-            await websocket.send_json(status)
+            snap = get_state_snapshot()
+            await websocket.send_json(snap)
             await asyncio.sleep(5)
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
@@ -3083,10 +3246,31 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
 
 # Helper functions
-def get_symbol_for_datetime(dt: datetime) -> str:
+def is_symbol_tradeable(symbol: str) -> bool:
+    """Broker හි symbol එක available සහ tradeableදැයි check."""
+    try:
+        info = mt5.get_symbol_info(symbol)
+        if info is None:
+            return False
+        trade_mode = _field(info, "trade_mode", default=1)
+        if isinstance(trade_mode, int) and trade_mode == 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def get_symbol_for_datetime(dt: datetime) -> Optional[str]:
+    """Weekday -> XAUUSD, Weekend -> BTCUSD (tradeable check)."""
     weekday = dt.weekday()
-    if weekday <= 4: return "XAUUSD"
-    else: return "BTCUSD"
+    preferred = "XAUUSD" if weekday <= 4 else "BTCUSD"
+    if is_symbol_tradeable(preferred):
+        return preferred
+    fallback = "BTCUSD" if preferred == "XAUUSD" else "XAUUSD"
+    if is_symbol_tradeable(fallback):
+        logger.warning(f"⚠️ Preferred symbol {preferred} not tradeable; using {fallback}")
+        return fallback
+    return None
 
 def check_daily_reset():
     now = _market_time()
@@ -3114,10 +3298,7 @@ def check_daily_reset():
     state.consecutive_loss_cooldown_until = None
     logger.info(f"✅ Reset Complete | Start: ${state.daily_starting_balance:.2f}")
     logger.info("=" * 60)
-    try:
-        asyncio.create_task(notify(format_daily_summary()))
-    except RuntimeError:
-        pass
+    notify_from_trading_thread(format_daily_summary())
     return True
 
 def update_daily_peak():
@@ -3207,9 +3388,11 @@ def get_today_news() -> List[Dict]:
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 15: MAIN TRADING LOOP & STARTUP/SHUTDOWN
 # ═══════════════════════════════════════════════════════════════════════
-async def trading_cycle():
+def trading_cycle_sync():
+    """සියලුම logic sync. Event loop block නැහැ."""
     check_daily_reset()
     state.mt5_connected = check_mt5_connection()
+
     if state.mt5_connected:
         sync_account_state()
         sync_open_positions_from_broker()
@@ -3217,19 +3400,31 @@ async def trading_cycle():
         state.open_trades.clear()
         state.active_trade = None
         state.runner_trade = None
+
     if state.auto_trading and not state.mt5_connected:
         state.auto_trading = False
         logger.critical("🔒 SAFETY KILL | Auto trading disabled — MT5 connection lost")
-    state.current_symbol = get_symbol_for_datetime(_market_time())
+
+    symbol = get_symbol_for_datetime(_market_time())
+    if symbol is None:
+        logger.warning("⚠️ No tradeable symbol found — skipping cycle")
+        _publish_state_snapshot()
+        return
+    state.current_symbol = symbol
     update_trading_mode()
     current_session = detect_session()
     state.session = current_session.value
+
     if not check_session_enabled(current_session.value):
+        _publish_state_snapshot()
         return
+
     htf_df, itf_df, ltf_df = get_multi_timeframe_data(state.current_symbol)
     if ltf_df.empty or htf_df.empty:
         logger.warning("⚠️ Data fetch empty — skipping cycle")
+        _publish_state_snapshot()
         return
+
     spread_check = check_spread_filter(state.current_symbol, ltf_df)
     manage_active_trade(ltf_df, htf_df)
     news_status = check_news_protection()
@@ -3240,28 +3435,43 @@ async def trading_cycle():
     state.last_score = asdict(score)
     regime = check_market_regime(ltf_df)
     state.last_score["market_regime"] = regime
+
     if not state.auto_trading:
+        _publish_state_snapshot()
         return
+
     if news_status.get("blocked"):
         logger.info(f"⛔ NEWS FREEZE | {news_status.get('reason', '')}")
+        _publish_state_snapshot()
         return
+
     if not spread_check["allowed"]:
         logger.info(f"⛔ {spread_check['reason']}")
+        _publish_state_snapshot()
         return
+
     allowed, reason = run_safety_checks(ltf_df)
     if not allowed:
         logger.info(f"⛔ SAFETY BLOCK | {reason}")
+        _publish_state_snapshot()
         return
+
     if state.daily_trades >= settings.MAX_DAILY_TRADES:
         logger.info(f"⛔ DAILY TRADE LIMIT | {state.daily_trades}/{settings.MAX_DAILY_TRADES}")
+        _publish_state_snapshot()
         return
+
     if not check_session_limits(current_session.value):
+        _publish_state_snapshot()
         return
+
     if state.mt5_connected and state.free_margin > 0:
         min_free = state.balance * float(getattr(settings, 'MIN_FREE_MARGIN_BUFFER_PCT', 0.10))
         if state.free_margin < min_free:
             logger.info(f"⛔ FREE MARGIN LOW | free:{state.free_margin:.2f} < required:{min_free:.2f}")
+            _publish_state_snapshot()
             return
+
     max_positions = get_max_open_positions()
     open_count = len(state.open_trades)
     if open_count >= max_positions:
@@ -3271,74 +3481,214 @@ async def trading_cycle():
                 state.daily_trades += 1
                 increment_session_trade(current_session.value)
                 logger.info(f"🔁 SCALE-IN EXECUTED | {scale_plan.direction} @ {scale_plan.entry:.2f}")
-                await notify(format_entry_alert(scale_plan, state.current_symbol, score, current_session.value))
+                notify_from_trading_thread(format_entry_alert(scale_plan, state.current_symbol, score, current_session.value))
+        _publish_state_snapshot()
         return
+
     if score.decision not in ("BUY", "SELL"):
+        _publish_state_snapshot()
         return
+
     direction = "BUY" if score.decision == "BUY" else "SELL"
     entry = float(ltf_df['Close'].iloc[-1])
     sl, tp = calculate_sl_tp(direction, entry, ltf_df, htf_df)
-    if state.mode == "SINGLE_TRADE":
-        tp = 0.0
-    plan = validate_trade(direction, entry, sl, tp, state.balance, state.current_symbol,
-                          allow_no_tp=(state.mode == "SINGLE_TRADE"))
-    if not plan.valid:
-        logger.info(f"⛔ TRADE REJECTED | {plan.reason}")
+if state.mode == "SINGLE_TRADE":
+    plan.tp = 0.0
+    magic = MAGIC_SINGLE
+    executed = execute_trade_plan(plan, state.current_symbol, magic)
+else:
+    specs = get_symbol_specs(state.current_symbol)
+    step = float(specs["lot_step"])
+    half_size = math.floor((plan.position_size / 2) / max(step, 1e-8)) * max(step, 1e-8)
+    if half_size < float(specs["min_lot"]):
+        logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
+        _publish_state_snapshot()
         return
-    if regime["size_multiplier"] < 1.0:
-        reduced = plan.position_size * float(regime["size_multiplier"])
-        step = float(get_symbol_specs(state.current_symbol)["lot_step"])
-        plan.position_size = math.floor(reduced / max(step, 1e-8)) * max(step, 1e-8)
-        if plan.position_size <= 0:
-            logger.info("⛔ REGIME SIZE REDUCTION would violate minimum-risk lot; trade rejected")
-            return
-    if state.mode == "SINGLE_TRADE":
-        plan.tp = 0.0
-        magic = MAGIC_SINGLE
-        executed = execute_trade_plan(plan, state.current_symbol, magic)
-    else:
-        specs = get_symbol_specs(state.current_symbol)
-        step = float(specs["lot_step"])
-        half_size = math.floor((plan.position_size / 2) / max(step, 1e-8)) * max(step, 1e-8)
-        if half_size < float(specs["min_lot"]):
-            logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
-            return
-        plan1 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=plan.tp,
-                           position_size=half_size, rr_ratio=plan.rr_ratio,
-                           actual_risk=half_size * abs(plan.entry-plan.sl) * float(specs["contract_size"]))
-        plan2 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=0.0,
-                           position_size=half_size, rr_ratio=plan.rr_ratio,
-                           actual_risk=plan1.actual_risk)
-        executed = execute_trade_plan(plan1, state.current_symbol, MAGIC_SPLIT_1)
-        if executed:
-            runner_executed = execute_trade_plan(plan2, state.current_symbol, MAGIC_SPLIT_2)
-            if not runner_executed:
-                logger.critical("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected")
-            else:
-                state.runner_trade = state.open_trades.get(
-                    next((k for k, v in state.open_trades.items() if v.get("magic") == MAGIC_SPLIT_2), ""))
+
+    plan1 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=plan.tp,
+                       position_size=half_size, rr_ratio=plan.rr_ratio,
+                       actual_risk=half_size * abs(plan.entry-plan.sl) * float(specs["contract_size"]))
+    plan2 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=0.0,
+                       position_size=half_size, rr_ratio=plan.rr_ratio,
+                       actual_risk=plan1.actual_risk)
+
+    executed = execute_trade_plan(plan1, state.current_symbol, MAGIC_SPLIT_1)
+    if executed:
+        runner_executed = execute_trade_plan(plan2, state.current_symbol, MAGIC_SPLIT_2)
+        if not runner_executed:
+            # Partial execution: fixed leg open, runner rejected
+            logger.warning("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected. Managing fixed leg as standalone trade.")
+            notify_from_trading_thread("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected.")
+            # Actual risk already recorded as half_size (plan1.actual_risk)
+            # No runner_trade; scale-in/retreat logic will be disabled because state.runner_trade remains None
         else:
-            executed = False
+            state.runner_trade = state.open_trades.get(
+                next((k for k, v in state.open_trades.items() if v.get("magic") == MAGIC_SPLIT_2), ""))
+    else:
+        executed = False
+
     if executed:
         state.daily_trades += 1
         increment_session_trade(current_session.value)
         logger.info(f"🚀 TRADE EXECUTED | {direction} {state.current_symbol} | Mode:{state.mode} | Score L{score.long_score}/S{score.short_score}")
-        await notify(format_entry_alert(plan, state.current_symbol, score, current_session.value))
+        notify_from_trading_thread(format_entry_alert(plan, state.current_symbol, score, current_session.value))
 
-async def trading_loop():
-    logger.info("🚀 SMC Quant Engine v4.1 — Trading loop started")
+    _publish_state_snapshot()
+
+
+_last_ml_retrain = 0.0
+
+def trading_loop_sync():
+    global _last_ml_retrain
+    logger.info("🚀 SMC Quant Engine v4.1 — Trading thread started")
+
     while state.running:
         try:
-            await trading_cycle()
+            # Process commands from FastAPI main thread
+            while True:
+                try:
+                    cmd = _trading_cmd_queue.get_nowait()
+                    if cmd.get("action") == "toggle_auto":
+                        state.auto_trading = cmd.get("value", not state.auto_trading)
+                        logger.info(f"🔄 CMD: auto_trading = {state.auto_trading}")
+                    elif cmd.get("action") == "reset_halt":
+                        state.daily_trading_halted = False
+                        state.daily_halt_reason = ""
+                        state.consecutive_loss_cooldown_until = None
+                        logger.warning("🔓 CMD: Daily halt reset")
+                    elif cmd.get("action") == "close_all":
+                        # Close ALL our open positions, not just active_trade
+                        for ticket_str, trade in list(state.open_trades.items()):
+                            close_mt5_position(int(ticket_str), "WEBHOOK_CLOSE")
+                        state.open_trades.clear()
+                        state.active_trade = None
+                        state.runner_trade = None
+                        save_trade_state()
+                        logger.info("🔴 CMD: All positions closed via webhook")
+                    elif cmd.get("action") == "update_settings":
+                        for k, v in cmd.get("settings", {}).items():
+                            if hasattr(settings, k.upper()):
+                                setattr(settings, k.upper(), v)
+                        logger.info("⚙️ CMD: Settings updated")
+                    elif cmd.get("action") == "shutdown":
+                        state.running = False
+                        logger.info("🛑 CMD: Shutdown requested")
+                except queue.Empty:
+                    break
+
+            if not state.running:
+                break
+
+            trading_cycle_sync()
+
+            # ML retrain check (every 6 hours) — runs in this thread
+            now = time.time()
+            if now - _last_ml_retrain >= getattr(settings, 'ML_RETRAIN_HOURS', 6) * 3600:
+                if getattr(settings, 'ENABLE_ML_ENGINE', True) and XGBOOST_AVAILABLE:
+                    try:
+                        symbol = get_symbol_for_datetime(datetime.now())
+                        df = fetch_and_build(symbol, "5M", 500)
+                        if not df.empty:
+                            ml_engine.train(df, symbol)
+                    except Exception as e:
+                        logger.error(f"ML retrain error: {e}")
+                _last_ml_retrain = now
+
         except Exception as e:
             logger.error(f"❌ Trading cycle error: {e}", exc_info=True)
-        await asyncio.sleep(getattr(settings, 'LOOP_INTERVAL_SECONDS', 30))
+
+        time.sleep(getattr(settings, 'LOOP_INTERVAL_SECONDS', 30))
+
+    # Graceful shutdown
+    save_trade_state()
+    save_runtime_state()
+    logger.info("🛑 Trading thread exited gracefully")
 
 @app.on_event("startup")
 async def on_startup():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+
     logger.info("=" * 60)
     logger.info("🏆 SMC INSTITUTIONAL QUANT ENGINE v4.1 — STARTING")
     logger.info("=" * 60)
+
+    # 1) Load persisted runtime state first (so it doesn't overwrite broker sync later)
+    load_runtime_state()
+
+    # 2) Start notification bridge in main event loop
+    asyncio.create_task(_notification_bridge())
+
+    # 3) Attempt MT5 connect (blocking call offloaded to thread)
+    try:
+        connected = await asyncio.wait_for(
+            asyncio.to_thread(
+                mt5.connect,
+                getattr(settings, 'EXNESS_ACCOUNT_ID', 0),
+                getattr(settings, 'EXNESS_PASSWORD', ''),
+                getattr(settings, 'EXNESS_SERVER', ''),
+            ),
+            timeout=10
+        )
+        state.mt5_connected = bool(connected) or check_mt5_connection()
+    except Exception as e:
+        logger.error(f"MT5 connect failed: {e}")
+        state.mt5_connected = False
+
+    # 4) If connected, sync account state & recover trades
+    if state.mt5_connected:
+        try:
+            broker_balance = mt5.get_balance()
+            if broker_balance is not None:
+                state.balance = float(broker_balance)
+                state.equity = _get_broker_equity(state.balance)
+                state.daily_starting_balance = state.balance
+                state.daily_peak = state.equity
+                state.peak_equity = state.equity
+                state.equity_curve = [state.equity]
+        except Exception as e:
+            logger.warning(f"Balance sync failed: {e}")
+
+        state.current_symbol = get_symbol_for_datetime(_market_time())
+        update_trading_mode()
+        check_daily_reset()
+        recover_active_trade_from_mt5()
+    else:
+        logger.warning("⚠️ MT5 not connected at startup — auto trading will be disabled")
+
+    # 5) Load ML model if available
+    if getattr(settings, 'ENABLE_ML_ENGINE', True) and XGBOOST_AVAILABLE:
+        ml_engine.load(state.current_symbol)
+
+    # 6) Start news refresh in separate daemon thread (lightweight polling)
+    def news_refresh_sync():
+        while state.running:
+            try:
+                news_mgr.fetch_calendar()
+            except Exception:
+                pass
+            time.sleep(3600)
+
+    threading.Thread(target=news_refresh_sync, daemon=True).start()
+
+    # 7) Start the main trading thread (daemon=True)
+    threading.Thread(target=trading_loop_sync, daemon=True).start()
+
+    # 8) Security warning
+    if getattr(settings, "REQUIRE_WEBHOOK_AUTH", True) and not getattr(settings, "ADMIN_API_KEY", ""):
+        logger.critical("🔐 SECURITY WARNING | REQUIRE_WEBHOOK_AUTH=True but ADMIN_API_KEY is empty")
+
+    logger.info(f"✅ STARTUP COMPLETE | MT5:{state.mt5_connected} | Balance:${state.balance:.2f} | Equity:${state.equity:.2f} | Mode:{state.mode}")
+    logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    state.running = False
+    _trading_cmd_queue.put({"action": "shutdown"})
+    # Give trading thread time to save state gracefully
+    await asyncio.sleep(3)
+    logger.info("🛑 SMC Quant Engine v4.1 — Shutdown complete")
     try:
         connected = await asyncio.wait_for(
             asyncio.to_thread(mt5.connect,
