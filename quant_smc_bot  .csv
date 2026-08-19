@@ -1,0 +1,3404 @@
+"""SMC Quant Engine v4.1 — Production-Hardened Build
+FIX #1-#13 + Blueprint Compliance
+Extended: MT5 Execution Engine, Trade Management, ML Blending,
+Notifications, Safety Enforcement, Main Trading Loop
+"""
+import asyncio
+import json
+import logging
+import os
+import math
+import time
+import html
+import pickle
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, field, asdict
+from collections import deque
+from pathlib import Path
+from enum import Enum
+
+import numpy as np
+import pandas as pd
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+try:
+    from sklearn.isotonic import IsotonicRegression
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+
+try:
+    import catboost as cb
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 1: IMPORTS, SETTINGS, STATE, FASTAPI APP
+# ═══════════════════════════════════════════════════════════════════════
+try:
+    from config.settings import settings
+except ImportError:
+    class _Settings:
+        EXNESS_ACCOUNT_ID = 0
+        EXNESS_PASSWORD = ""
+        EXNESS_SERVER = ""
+        PRIMARY_SYMBOL = "XAUUSD"
+        RISK_PER_TRADE_PCT = 0.01
+        MIN_RR_RATIO = 2.0
+        MAX_DAILY_TRADES = 4
+        MAX_TRADES_PER_SESSION = 2
+        ENABLE_ASIAN_SESSION = True
+        ENABLE_LONDON_SESSION = True
+        ENABLE_NEWYORK_SESSION = True
+        ENABLE_SESSION_LIMITS = True
+        ASIAN_AUTO_ELEVATE = True
+        NEWS_PROTECTION = True
+        PRE_NEWS_MINUTES = 30
+        NEWS_FREEZE_MINUTES = 20
+        DAILY_MAX_DRAWDOWN_PCT = 0.05
+        SESSION_MAX_DRAWDOWN_PCT = 0.03
+        CONSECUTIVE_LOSS_LIMIT = 3
+        SPREAD_LIMIT_GOLD = 5.0
+        SPREAD_LIMIT_BTC = 50.0
+        HOST = "0.0.0.0"
+        PORT = 8080
+        TELEGRAM_BOT_TOKEN = ""
+        TELEGRAM_CHAT_ID = ""
+        DISCORD_WEBHOOK_URL = ""
+        ENABLE_TELEGRAM_ALERTS = False
+        ENABLE_DISCORD_ALERTS = False
+        ENABLE_ML_ENGINE = True
+        ML_RETRAIN_HOURS = 6
+        ML_MIN_SAMPLES = 50
+        ML_WEIGHT = 0.30
+        RULE_WEIGHT = 0.70
+        VOLATILITY_FILTER = True
+        MARKET_REGIME_DETECT = True
+        DXY_CORRELATION = False
+        MODE_SWITCH_BALANCE = 100.0
+        LOOP_INTERVAL_SECONDS = 30
+        ADMIN_API_KEY = ""
+        REQUIRE_WEBHOOK_AUTH = True
+        REQUIRE_ADMIN_AUTH = True
+        MAX_RISK_PER_TRADE_PCT = 0.01
+        MIN_FREE_MARGIN_BUFFER_PCT = 0.10
+        ALLOW_UNVERIFIED_SPREAD = False
+        MAX_SLIPPAGE_POINTS = 100
+
+        # Advanced configs
+        MARKET_TIMEZONE_OFFSET = 2
+        ENABLE_TICK_DATA = False
+        ORDERBOOK_DEPTH = 5
+        TRIPLE_BARRIER_HORIZON = 6
+        TRIPLE_BARRIER_ATR_MULT = 2.0
+        FRACTIONAL_DIFF_D = 0.35
+        ML_ENSEMBLE_WEIGHTS = {"xgb": 0.4, "lgbm": 0.35, "cat": 0.25}
+        MODEL_CALIBRATION = "isotonic"
+        WALK_FORWARD_WINDOW = "1W"
+        MONTE_CARLO_SIMS = 1000
+        BACKTEST_MODE = False
+        PROMETHEUS_ENABLED = False
+        LOG_JSON = False
+        DATA_BARS = 200
+        ADX_TREND_THRESHOLD = 25.0
+        VOLATILITY_FILTER_PERCENTILE = 0.10
+        DAILY_MAX_LOSS_AMOUNT = 0.0
+        MIN_VIABLE_BALANCE = 0.0
+        MAX_SCALE_INS = 2
+        DXY_SYMBOL = "DXY"
+        DXY_TIMEFRAME = "1H"
+        ENABLE_PHASE11A_SCAN = False
+    settings = _Settings()
+
+try:
+    from mt5.connector import MT5Connector
+    mt5 = MT5Connector()
+except ImportError:
+    class _FakeMT5:
+        def connect(self, *a, **k): return False
+        def get_balance(self): return 15.0
+        def fetch_rates(self, *a, **k): return pd.DataFrame()
+        def send_order(self, *a, **k): return {"retcode": -1}
+        def close_position(self, *a, **k): pass
+        def modify_sl(self, *a, **k): pass
+        def get_position_profit(self, *a, **k): return 0.0
+        def get_positions(self): return []
+        def terminal_info(self): return {"connected": False}
+        def get_symbol_info(self, *a, **k): return None
+        def get_spread(self, *a, **k): return 0.0
+    mt5 = _FakeMT5()
+
+try:
+    from utils.news import NewsManager
+    news_mgr = NewsManager()
+except ImportError:
+    class _FakeNews:
+        def check_news_window(self, *a, **k): return {"blocked": False}
+        def fetch_calendar(self): pass
+        def get_today_events(self): return []
+    news_mgr = _FakeNews()
+
+# Logging
+Path("logs").mkdir(exist_ok=True)
+Path("data").mkdir(exist_ok=True)
+Path("models").mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    handlers=[
+        logging.FileHandler("logs/bot.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("SMCv4")
+
+# State & Persistence
+TRADE_STATE_FILE = Path("data/active_trade.json")
+RUNTIME_STATE_FILE = Path("data/runtime_state.json")
+MAGIC_SINGLE = 1000
+MAGIC_SPLIT_1 = 1001
+MAGIC_SPLIT_2 = 1002
+MAGIC_SCALE_IN = 1003
+OUR_MAGICS = {MAGIC_SINGLE, MAGIC_SPLIT_1, MAGIC_SPLIT_2, MAGIC_SCALE_IN}
+
+@dataclass
+class BotState:
+    auto_trading: bool = False
+    balance: float = 15.0
+    mode: str = "SINGLE_TRADE"
+    daily_trades: int = 0
+    daily_wins: int = 0
+    daily_losses: int = 0
+    daily_be: int = 0
+    consecutive_losses: int = 0
+    total_r: float = 0.0
+    max_drawdown: float = 0.0
+    current_symbol: str = "XAUUSD"
+    session: str = ""
+    last_score: Optional[Dict] = None
+    last_trade: Optional[Dict] = None
+    active_trade: Optional[Dict] = None
+    open_trades: Dict[str, Dict] = field(default_factory=dict)
+    equity: float = 15.0
+    free_margin: float = 0.0
+    peak_equity: float = 15.0
+    trade_history: deque = field(default_factory=lambda: deque(maxlen=100))
+    equity_curve: List[float] = field(default_factory=lambda: [15.0])
+    running: bool = True
+    daily_starting_balance: float = 15.0
+    daily_peak: float = 15.0
+    last_reset_date: str = ""
+    session_trades: Dict[str, int] = field(default_factory=dict)
+    session_start_balance: Dict[str, float] = field(default_factory=dict)
+    session_peak: Dict[str, float] = field(default_factory=dict)
+    session_max_dd: Dict[str, float] = field(default_factory=dict)
+    current_spread: float = 0.0
+    mt5_connected: bool = False
+    trade_recovered: bool = False
+    daily_trading_halted: bool = False
+    daily_halt_reason: str = ""
+    session_cooldown_until: Dict[str, str] = field(default_factory=dict)
+    consecutive_loss_cooldown_until: Optional[str] = None
+    runner_trade: Optional[Dict] = None
+    last_ml_train_time: Optional[str] = None
+    ml_model_ready: bool = False
+
+state = BotState()
+
+app = FastAPI(title="SMC Quant Engine v4.1", version="4.1.0")
+# app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 2: MT5 CONNECTION & PERSISTENCE
+# ═══════════════════════════════════════════════════════════════════════
+def check_mt5_connection(symbol: Optional[str] = None) -> bool:
+    symbol = symbol or getattr(state, 'current_symbol', 'XAUUSD')
+    try:
+        if hasattr(mt5, "terminal_info"):
+            info = mt5.terminal_info()
+            if info is not None:
+                if isinstance(info, dict):
+                    if "connected" in info:
+                        return bool(info["connected"])
+                elif hasattr(info, "connected"):
+                    return bool(info.connected)
+        if hasattr(mt5, "get_positions"):
+            positions = mt5.get_positions()
+            if positions is not None:
+                return True
+        if hasattr(mt5, "positions_get"):
+            positions = mt5.positions_get()
+            if positions is not None:
+                return True
+        if hasattr(mt5, "get_symbol_info"):
+            info = mt5.get_symbol_info(symbol)
+            if info is not None:
+                return True
+        if hasattr(mt5, "get_balance"):
+            balance = mt5.get_balance()
+            if balance is not None:
+                return True
+    except Exception as e:
+        logger.warning(f"MT5 check failed: {e}")
+    return False
+
+def is_mt5_connected() -> bool:
+    state.mt5_connected = check_mt5_connection()
+    return state.mt5_connected
+
+def _atomic_json_write(path: Path, payload: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def save_trade_state():
+    try:
+        payload = {
+            "active_trade": state.active_trade,
+            "open_trades": state.open_trades,
+            "runner_trade": state.runner_trade,
+            "saved_at": datetime.now().isoformat(),
+        }
+        _atomic_json_write(TRADE_STATE_FILE, payload)
+    except Exception as e:
+        logger.error(f"Save trade state failed: {e}")
+
+def load_trade_state() -> Optional[Dict]:
+    try:
+        if TRADE_STATE_FILE.exists():
+            with open(TRADE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "active_trade" not in data and "ticket" in data:
+                return {"active_trade": data, "open_trades": {str(data.get("ticket")): data}}
+            return data
+    except Exception as e:
+        logger.error(f"Load trade state failed: {e}")
+    return None
+
+def save_runtime_state():
+    try:
+        payload = {
+            "daily_trades": state.daily_trades,
+            "daily_wins": state.daily_wins,
+            "daily_losses": state.daily_losses,
+            "daily_be": state.daily_be,
+            "consecutive_losses": state.consecutive_losses,
+            "total_r": state.total_r,
+            "max_drawdown": state.max_drawdown,
+            "balance": state.balance,
+            "equity": state.equity,
+            "peak_equity": state.peak_equity,
+            "daily_peak": state.daily_peak,
+            "daily_starting_balance": state.daily_starting_balance,
+            "last_reset_date": state.last_reset_date,
+            "session_trades": state.session_trades,
+            "session_start_balance": state.session_start_balance,
+            "session_peak": state.session_peak,
+            "session_max_dd": state.session_max_dd,
+            "last_ml_train_time": state.last_ml_train_time,
+            "ml_model_ready": state.ml_model_ready,
+            "saved_at": datetime.now().isoformat(),
+        }
+        _atomic_json_write(RUNTIME_STATE_FILE, payload)
+    except Exception as e:
+        logger.error(f"Save runtime state failed: {e}")
+
+def load_runtime_state() -> None:
+    if not RUNTIME_STATE_FILE.exists():
+        return
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, value in data.items():
+            if hasattr(state, key) and key not in ("trade_history", "equity_curve"):
+                setattr(state, key, value)
+        logger.info("📥 Runtime state loaded")
+    except Exception as e:
+        logger.error(f"Load runtime state failed: {e}")
+
+def _field(obj: Any, *names: str, default=None):
+    for name in names:
+        try:
+            if isinstance(obj, dict) and name in obj:
+                return obj[name]
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        except Exception:
+            pass
+    return default
+
+def get_open_mt5_positions() -> List[Any]:
+    try:
+        if hasattr(mt5, "get_positions"):
+            positions = mt5.get_positions()
+            if positions is not None:
+                return list(positions)
+        if hasattr(mt5, "positions_get"):
+            positions = mt5.positions_get()
+            if positions is not None:
+                return list(positions)
+        if hasattr(mt5, "terminal"):
+            terminal = mt5.terminal()
+            if terminal and hasattr(terminal, "positions_get"):
+                positions = terminal.positions_get()
+                if positions is not None:
+                    return list(positions)
+    except Exception as e:
+        logger.warning(f"MT5 positions fetch failed: {e}")
+    return []
+
+def _position_to_trade(pos: Any, persisted: Optional[Dict] = None) -> Optional[Dict]:
+    ticket = _field(pos, "ticket")
+    if ticket is None:
+        return None
+    magic = int(_field(pos, "magic", default=0) or 0)
+    if magic not in OUR_MAGICS:
+        return None
+    raw_type = _field(pos, "type", default=0)
+    direction = "BUY" if raw_type in (0, "BUY", "buy", "POSITION_TYPE_BUY") else "SELL"
+    symbol = str(_field(pos, "symbol", default=state.current_symbol))
+    entry = float(_field(pos, "price_open", "open_price", default=0) or 0)
+    sl = float(_field(pos, "sl", default=0) or 0)
+    tp = float(_field(pos, "tp", default=0) or 0)
+    size = float(_field(pos, "volume", "lots", default=0) or 0)
+    if entry <= 0 or size <= 0:
+        return None
+    old = persisted or {}
+    initial_sl = float(old.get("initial_sl", sl) or sl)
+    initial_risk = float(old.get("initial_risk", abs(entry - initial_sl)) or abs(entry - initial_sl) or 1e-8)
+    return {
+        "ticket": int(ticket), "symbol": symbol, "direction": direction,
+        "entry": entry, "sl": sl, "initial_sl": initial_sl,
+        "initial_risk": initial_risk, "tp": tp, "size": size,
+        "actual_risk": float(old.get("actual_risk", 0) or 0), "magic": magic,
+        "open_time": old.get("open_time", datetime.now().isoformat()),
+        "breakeven": bool(old.get("breakeven", False)),
+        "highest_r": float(old.get("highest_r", 0) or 0),
+        "news_protected": bool(old.get("news_protected", False)),
+        "news_frozen": bool(old.get("news_frozen", False)),
+    }
+
+def fetch_mt5_history_deals(symbol: Optional[str] = None, since: Optional[datetime] = None) -> List[Dict]:
+    try:
+        if hasattr(mt5, "history_deals_get"):
+            deals = mt5.history_deals_get(symbol=symbol, since=since)
+            return list(deals) if deals else []
+        if hasattr(mt5, "terminal"):
+            terminal = mt5.terminal()
+            if terminal and hasattr(terminal, "history_deals_get"):
+                deals = terminal.history_deals_get(symbol=symbol, since=since)
+                return list(deals) if deals else []
+    except Exception as e:
+        logger.warning(f"MT5 history deals fetch failed: {e}")
+    return []
+
+def sync_open_positions_from_broker() -> List[Dict]:
+    persisted = load_trade_state() or {}
+    persisted_map = persisted.get("open_trades", {}) if isinstance(persisted, dict) else {}
+    broker_positions = get_open_mt5_positions()
+    our_trades = []
+    for pos in broker_positions:
+        magic = _field(pos, "magic", default=None)
+        if magic in OUR_MAGICS:
+            ticket = _field(pos, "ticket")
+            trade = _position_to_trade(pos, persisted_map.get(str(ticket)))
+            if trade:
+                our_trades.append(trade)
+    state.open_trades = {str(t["ticket"]): t for t in our_trades}
+    state.active_trade = our_trades[0] if our_trades else None
+    state.runner_trade = next((t for t in our_trades if t.get("magic") == MAGIC_SPLIT_2), None)
+    save_trade_state()
+    return our_trades
+
+def recover_active_trade_from_mt5() -> bool:
+    if not state.mt5_connected:
+        return False
+    persisted = load_trade_state() or {}
+    persisted_map = persisted.get("open_trades", {}) if isinstance(persisted, dict) else {}
+    positions = get_open_mt5_positions()
+    our_trades = []
+    for pos in positions:
+        magic = _field(pos, "magic", default=None)
+        if magic in OUR_MAGICS:
+            ticket = _field(pos, "ticket")
+            trade = _position_to_trade(pos, persisted_map.get(str(ticket)))
+            if trade:
+                our_trades.append(trade)
+    if our_trades:
+        state.open_trades = {str(t["ticket"]): t for t in our_trades}
+        state.active_trade = our_trades[0] if our_trades else None
+        state.runner_trade = next((t for t in our_trades if t.get("magic") == MAGIC_SPLIT_2), None)
+        state.trade_recovered = True
+        save_trade_state()
+        logger.warning(f"♻️ BROKER RECONCILIATION | recovered {len(our_trades)} SMC position(s)")
+        return True
+    else:
+        state.open_trades = {}
+        state.active_trade = None
+        state.runner_trade = None
+        state.trade_recovered = False
+        save_trade_state()
+        logger.info("📭 No SMC positions in MT5")
+        return False
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 3: STRUCTURE, SWING DETECTION, BOS/CHOCH, FEATURES
+# ═══════════════════════════════════════════════════════════════════════
+class Structure(Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    NEUTRAL = "NEUTRAL"
+    BULLISH_CHOCH = "BULLISH_CHOCH"
+    BEARISH_CHOCH = "BEARISH_CHOCH"
+    BULLISH_BOS = "BULLISH_BOS"
+    BEARISH_BOS = "BEARISH_BOS"
+
+def detect_swings(df: pd.DataFrame, left: int = 3, right: int = 3,
+                  atr_filter: bool = True, volume_filter: bool = False) -> pd.DataFrame:
+    df = df.copy()
+    high = df['High']
+    low = df['Low']
+    is_swing_high = pd.Series(True, index=df.index)
+    is_swing_low = pd.Series(True, index=df.index)
+    for j in range(1, left + 1):
+        is_swing_high &= high > high.shift(j)
+        is_swing_low &= low < low.shift(j)
+    for j in range(1, right + 1):
+        is_swing_high &= high > high.shift(-j)
+        is_swing_low &= low < low.shift(-j)
+    is_swing_high = is_swing_high.fillna(False)
+    is_swing_low = is_swing_low.fillna(False)
+    if atr_filter:
+        candle_range = (high - low).clip(lower=1e-8)
+        atr = candle_range.rolling(14).mean().fillna(candle_range.mean())
+        atr_threshold = atr * 0.5
+        is_swing_high &= candle_range > atr_threshold
+        is_swing_low &= candle_range > atr_threshold
+    if volume_filter and 'Volume' in df.columns:
+        volume = df['Volume']
+        vol_mean = volume.rolling(20).mean().fillna(volume.mean())
+        vol_spike = volume > vol_mean * 1.2
+        is_swing_high &= vol_spike
+        is_swing_low &= vol_spike
+    df['swing_high'] = is_swing_high
+    df['swing_low'] = is_swing_low
+    return df
+
+def detect_bos_choch(df: pd.DataFrame, use_sweep_reclaim: bool = True) -> Tuple[Structure, Dict]:
+    df = detect_swings(df)
+    swing_highs = df[df['swing_high']].copy()
+    swing_lows = df[df['swing_low']].copy()
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return Structure.NEUTRAL, {}
+    last_sh = float(swing_highs['High'].iloc[-1])
+    prev_sh = float(swing_highs['High'].iloc[-2])
+    last_sl = float(swing_lows['Low'].iloc[-1])
+    prev_sl = float(swing_lows['Low'].iloc[-2])
+    last_close = float(df['Close'].iloc[-1])
+    recent_low = float(df['Low'].tail(5).min())
+    recent_high = float(df['High'].tail(5).max())
+    swept_low = recent_low < prev_sl and last_close > prev_sl
+    swept_high = recent_high > prev_sh and last_close < prev_sh
+    bullish_choch = (last_sl > prev_sl) and (last_close > last_sh) and swept_low
+    bearish_choch = (last_sh < prev_sh) and (last_close < last_sl) and swept_high
+    bullish_bos = last_close > prev_sh
+    bearish_bos = last_close < prev_sl
+    levels = {
+        "last_swing_high": last_sh,
+        "last_swing_low": last_sl,
+        "prev_swing_high": prev_sh,
+        "prev_swing_low": prev_sl,
+    }
+    if use_sweep_reclaim:
+        if bullish_choch:
+            return Structure.BULLISH_CHOCH, levels
+        elif bearish_choch:
+            return Structure.BEARISH_CHOCH, levels
+    if bullish_bos:
+        return Structure.BULLISH_BOS, levels
+    elif bearish_bos:
+        return Structure.BEARISH_BOS, levels
+    elif last_close > last_sl:
+        return Structure.BULLISH, levels
+    elif last_close < last_sh:
+        return Structure.BEARISH, levels
+    else:
+        return Structure.NEUTRAL, levels
+
+def build_smc_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or len(df) < 30:
+        return df
+    df = df.copy()
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(set(df.columns)):
+        rename_map = {c: c.capitalize() for c in df.columns}
+        df = df.rename(columns=rename_map)
+    if "Volume" not in df.columns:
+        df["Volume"] = 1.0
+    df = detect_swings(df)
+    df['fvg_bull'] = df['Low'] > df['High'].shift(2)
+    df['fvg_bear'] = df['Low'].shift(2) > df['High']
+    atr_proxy = (df['High'] - df['Low']).clip(lower=1e-8)
+    df['fvg_imbalance'] = ((df['Low'] - df['High'].shift(2)).clip(lower=0) -
+                           (df['Low'].shift(2) - df['High']).clip(lower=0)) / atr_proxy
+    df['fvg_total'] = (df['fvg_bull'].astype(int) + df['fvg_bear'].astype(int)) / 2.0
+    df['fvg_bull_filled'] = df['Low'] <= df['High'].shift(2)
+    df['fvg_bear_filled'] = df['High'] >= df['Low'].shift(2)
+    df['prev_body'] = (df['Close'].shift(1) - df['Open'].shift(1)).abs()
+    df['prev_range'] = (df['High'].shift(1) - df['Low'].shift(1)).abs().clip(lower=1e-8)
+    df['prev_bullish'] = df['Close'].shift(1) > df['Open'].shift(1)
+    df['prev_bearish'] = df['Close'].shift(1) < df['Open'].shift(1)
+    body_ratio = df['prev_body'] / df['prev_range']
+    df['bullish_ob'] = df['prev_bearish'] & (df['Close'] > df['Open']) & (body_ratio > 0.6)
+    df['bearish_ob'] = df['prev_bullish'] & (df['Close'] < df['Open']) & (body_ratio > 0.6)
+    df['prev_high_20'] = df['High'].rolling(20).max().shift(1)
+    df['prev_low_20'] = df['Low'].rolling(20).min().shift(1)
+    df['sweep_signal'] = 0
+    df.loc[df['High'] > df['prev_high_20'], 'sweep_signal'] = 1
+    df.loc[df['Low'] < df['prev_low_20'], 'sweep_signal'] = -1
+    df['sweep_strength_bull'] = (df['High'] - df['prev_high_20']) / df['Close']
+    df['sweep_strength_bear'] = (df['prev_low_20'] - df['Low']) / df['Close']
+    df['candle_range'] = (df['High'] - df['Low']).clip(lower=1e-8)
+    df['upper_wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['lower_wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+    df['wick_absorption'] = (df['upper_wick'] - df['lower_wick']) / df['candle_range']
+    df['upper_wick_pct'] = df['upper_wick'] / df['candle_range']
+    df['lower_wick_pct'] = df['lower_wick'] / df['candle_range']
+    if 'tick_delta' in df.columns:
+        df['delta'] = df['tick_delta']
+    else:
+        buy_ratio = (df['Close'] - df['Low']) / df['candle_range']
+        buy_ratio = buy_ratio.clip(0.0, 1.0)
+        taker_buy = df['Volume'] * buy_ratio
+        taker_sell = df['Volume'] - taker_buy
+        df['delta'] = taker_buy - taker_sell
+    df['delta_pct'] = df['delta'] / df['Volume'].clip(lower=1e-8)
+    df['cvd'] = df['delta'].cumsum()
+    df['cvd_divergence'] = df['cvd'].pct_change() - df['Close'].pct_change()
+    vol_window = 30
+    df['volume_mean'] = df['Volume'].rolling(vol_window).mean()
+    df['volume_ratio'] = df['Volume'] / df['volume_mean'].clip(lower=1e-8)
+    df['vsa_anomaly'] = df['volume_ratio'] / (df['candle_range'] / df['Close'])
+    def _rolling_vp(arr):
+        if len(arr) < 5:
+            return 0.0, 0.0, 0.0
+        try:
+            hist, edges = np.histogram(arr, bins=10)
+            max_bin = int(np.argmax(hist))
+            poc = (edges[max_bin] + edges[max_bin + 1]) / 2.0
+            total_vol = hist.sum()
+            cum = 0
+            mids = []
+            for idx, count in enumerate(hist):
+                cum += count
+                mids.append((edges[idx] + edges[idx + 1]) / 2.0)
+                if cum >= total_vol * 0.68:
+                    break
+            vah = max(mids)
+            val = min(mids)
+            return poc, vah, val
+        except Exception:
+            return 0.0, 0.0, 0.0
+    df['vp_poc'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[0], raw=False).ffill().fillna(0.0)
+    df['vp_vah'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[1], raw=False).ffill().fillna(0.0)
+    df['vp_val'] = df['Close'].rolling(vol_window).apply(lambda x: _rolling_vp(x)[2], raw=False).ffill().fillna(0.0)
+    df['pv'] = df['Close'] * df['Volume']
+    df['vwap'] = df['pv'].cumsum() / df['Volume'].cumsum().clip(lower=1e-8)
+    vwap_std = df['Close'].expanding().std().fillna(0.0)
+    df['vwap_std'] = vwap_std
+    df['vwap_dev'] = (df['Close'] - df['vwap']) / vwap_std.clip(lower=1e-8)
+    df['vwap_upper_1'] = df['vwap'] + vwap_std
+    df['vwap_lower_1'] = df['vwap'] - vwap_std
+    df['vwap_upper_2'] = df['vwap'] + 2 * vwap_std
+    df['vwap_lower_2'] = df['vwap'] - 2 * vwap_std
+    pd_window = 30
+    df['range_high'] = df['High'].rolling(pd_window).max()
+    df['range_low'] = df['Low'].rolling(pd_window).min()
+    df['price_range'] = (df['range_high'] - df['range_low']).clip(lower=1e-8)
+    df['pd_zone'] = (df['Close'] - df['range_low']) / df['price_range']
+    df['zone_premium'] = df['pd_zone'] > 0.70
+    df['zone_discount'] = df['pd_zone'] < 0.30
+    df['zone_equilibrium'] = (df['pd_zone'] >= 0.30) & (df['pd_zone'] <= 0.70)
+    df['atr'] = df['candle_range'].rolling(14).mean()
+    df['atr_pctile'] = df['atr'].rolling(100).rank(pct=True).fillna(0.5)
+    df['volatility_squeeze'] = (df['atr_pctile'] < 0.20).astype(int)
+    df['ema20'] = df['Close'].ewm(span=20).mean()
+    df['ema50'] = df['Close'].ewm(span=50).mean()
+    df['liquidity_pool_high'] = df['High'].rolling(20).max()
+    df['liquidity_pool_low'] = df['Low'].rolling(20).min()
+    df['near_pool_high'] = (df['High'] >= df['liquidity_pool_high'] * 0.999).astype(int)
+    df['near_pool_low'] = (df['Low'] <= df['liquidity_pool_low'] * 1.001).astype(int)
+    return df
+
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 11A: 5M SWING + ZONE + LIQUIDITY FOUNDATION
+# ═══════════════════════════════════════════════════════════════════════
+class SwingType(Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
+
+
+class SwingStatus(Enum):
+    CANDIDATE = "CANDIDATE"
+    ACTIVE = "ACTIVE"
+    SWEPT = "SWEPT"
+    REJECTED = "REJECTED"
+    CONFIRMED = "CONFIRMED"
+    INVALIDATED = "INVALIDATED"
+    EXPIRED = "EXPIRED"
+
+
+class LiquidityInteraction(Enum):
+    NONE = "NONE"
+    WICK_SWEEP = "WICK_SWEEP"
+    CLOSE_SWEEP = "CLOSE_SWEEP"
+    DEEP_SWEEP = "DEEP_SWEEP"
+    CLEAN_REJECTION = "CLEAN_REJECTION"
+    BREAKDOWN = "BREAKDOWN"
+    BREAKOUT = "BREAKOUT"
+
+
+@dataclass
+class SwingZone:
+    high: float
+    low: float
+    center: float
+    width: float
+    atr: float
+    source_swing_id: str = ""
+
+    @property
+    def midpoint(self) -> float:
+        return (self.high + self.low) / 2.0
+
+    def contains(self, price: float, tolerance: float = 0.0) -> bool:
+        p = float(price)
+        return (self.low - tolerance) <= p <= (self.high + tolerance)
+
+
+@dataclass
+class SwingCandidate:
+    id: str
+    type: SwingType
+    price: float
+    index: int
+    timestamp: str
+    strength: float
+    left_bars: int
+    right_bars: int
+    zone_high: float
+    zone_low: float
+    wick_size: float
+    body_size: float
+    candle_range: float
+    atr: float
+    atr_normalized_size: float
+    liquidity_level: Optional[float] = None
+    liquidity_source: str = ""
+    status: SwingStatus = SwingStatus.CANDIDATE
+    swept: bool = False
+    sweep_depth: float = 0.0
+    reaction_strength: float = 0.0
+    created_bar: int = 0
+    expires_bar: int = 0
+
+    @property
+    def zone(self) -> SwingZone:
+        return SwingZone(
+            high=self.zone_high,
+            low=self.zone_low,
+            center=self.price,
+            width=max(self.zone_high - self.zone_low, 0.0),
+            atr=self.atr,
+            source_swing_id=self.id,
+        )
+
+
+@dataclass
+class LiquidityEvent:
+    swing_id: str
+    swing_type: SwingType
+    level: float
+    timestamp: str
+    bar_index: int
+    interaction: LiquidityInteraction = LiquidityInteraction.NONE
+    penetration: float = 0.0
+    penetration_atr: float = 0.0
+    closed_beyond: bool = False
+    closed_back: bool = False
+    rejection: bool = False
+    valid_sweep: bool = False
+    quality: float = 0.0
+    reason: str = ""
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _bar_timestamp(df: pd.DataFrame, index: Any) -> str:
+    try:
+        value = df.index[index] if isinstance(index, (int, np.integer)) else index
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+    except Exception:
+        return ""
+
+
+def _rolling_atr_at(df: pd.DataFrame, i: int, period: int = 14) -> float:
+    if 'atr' in df.columns:
+        atr = _safe_float(df['atr'].iloc[i], 0.0)
+        if atr > 0:
+            return atr
+    start = max(0, i - period + 1)
+    ranges = (df['High'].iloc[start:i + 1] - df['Low'].iloc[start:i + 1]).astype(float)
+    atr = _safe_float(ranges.mean(), 0.0)
+    return atr
+
+
+def _swing_strength(df: pd.DataFrame, i: int, swing_type: SwingType,
+                    left: int = 3, right: int = 3) -> float:
+    atr = _rolling_atr_at(df, i)
+    if atr <= 0:
+        return 0.0
+    price = _safe_float(df['Low'].iloc[i] if swing_type == SwingType.LOW else df['High'].iloc[i])
+    left_start = max(0, i - left)
+    right_end = min(len(df), i + right + 1)
+    if swing_type == SwingType.LOW:
+        left_extreme = _safe_float(df['Low'].iloc[left_start:i].min(), price)
+        right_extreme = _safe_float(df['Low'].iloc[i + 1:right_end].min(), price)
+        excursion = max(left_extreme - price, right_extreme - price, 0.0)
+    else:
+        left_extreme = _safe_float(df['High'].iloc[left_start:i].max(), price)
+        right_extreme = _safe_float(df['High'].iloc[i + 1:right_end].max(), price)
+        excursion = max(price - left_extreme, price - right_extreme, 0.0)
+    candle_range = max(_safe_float(df['High'].iloc[i]) - _safe_float(df['Low'].iloc[i]), 0.0)
+    normalized = excursion / atr
+    range_component = min(candle_range / atr, 2.0)
+    return round(min(100.0, normalized * 30.0 + range_component * 15.0 + 25.0), 2)
+
+
+def _build_swing_zone(df: pd.DataFrame, i: int, swing_type: SwingType,
+                      swing_id: str) -> SwingZone:
+    high = _safe_float(df['High'].iloc[i])
+    low = _safe_float(df['Low'].iloc[i])
+    op = _safe_float(df['Open'].iloc[i])
+    close = _safe_float(df['Close'].iloc[i])
+    atr = _rolling_atr_at(df, i)
+    candle_range = max(high - low, 0.0)
+    body = abs(close - op)
+    upper_wick = max(high - max(op, close), 0.0)
+    lower_wick = max(min(op, close) - low, 0.0)
+
+    base = max(atr * 0.20, candle_range * 0.15, body * 0.25, 1e-8)
+    if swing_type == SwingType.LOW:
+        lower = max(base * 0.50, lower_wick * 0.20)
+        upper = max(base * 0.75, body * 0.35)
+        zone_low = low - lower
+        zone_high = low + upper
+    else:
+        upper = max(base * 0.50, upper_wick * 0.20)
+        lower = max(base * 0.75, body * 0.35)
+        zone_high = high + upper
+        zone_low = high - lower
+
+    return SwingZone(
+        high=round(zone_high, 8),
+        low=round(zone_low, 8),
+        center=round(low if swing_type == SwingType.LOW else high, 8),
+        width=round(max(zone_high - zone_low, 0.0), 8),
+        atr=round(atr, 8),
+        source_swing_id=swing_id,
+    )
+
+
+def _nearest_liquidity_level(price: float, swing_type: SwingType,
+                             pools: Dict, atr: float) -> Tuple[Optional[float], str]:
+    key = 'eql' if swing_type == SwingType.LOW else 'eqh'
+    levels = [] if not isinstance(pools, dict) else pools.get(key, []) or []
+    levels = [_safe_float(x, 0.0) for x in levels if _safe_float(x, 0.0) > 0]
+    if not levels:
+        return None, ""
+    max_distance = max(atr * 2.0, abs(price) * 0.002)
+    nearest = min(levels, key=lambda x: abs(x - price))
+    if abs(nearest - price) <= max_distance:
+        return round(nearest, 8), key.upper()
+    return None, ""
+
+
+def build_swing_candidates(df: pd.DataFrame, left: int = 3, right: int = 3,
+                           expiry_bars: int = 24) -> List[SwingCandidate]:
+    """Phase 11A: convert raw fractal swings into persistent setup candidates."""
+    if df.empty or len(df) < left + right + 3:
+        return []
+    marked = detect_swings(df, left=left, right=right)
+    try:
+        pools = detect_liquidity_pools(marked)
+    except Exception:
+        pools = {'eqh': [], 'eql': []}
+
+  candidates: List[SwingCandidate] = []
+  for i in range(left, len(marked) - right):
+      swing_type = None
+      if bool(marked['swing_low'].iloc[i]):
+          swing_type = SwingType.LOW
+      elif bool(marked['swing_high'].iloc[i]):
+          swing_type = SwingType.HIGH
+      if swing_type is None:
+          continue
+
+      price = _safe_float(marked['Low'].iloc[i] if swing_type == SwingType.LOW else marked['High'].iloc[i])
+      atr = _rolling_atr_at(marked, i)
+      swing_id = f"{swing_type.value}_{i}_{price:.8f}"
+      zone = _build_swing_zone(marked, i, swing_type, swing_id)
+      liquidity, source = _nearest_liquidity_level(price, swing_type, pools, atr)
+
+      candle_range = max(_safe_float(marked['High'].iloc[i]) - _safe_float(marked['Low'].iloc[i]), 0.0)
+      body = abs(_safe_float(marked['Close'].iloc[i]) - _safe_float(marked['Open'].iloc[i]))
+
+      if swing_type == SwingType.HIGH:
+          wick = max(
+              _safe_float(marked['High'].iloc[i]) -
+              max(_safe_float(marked['Open'].iloc[i]), _safe_float(marked['Close'].iloc[i])),
+              0.0
+          )
+      else:
+          wick = max(
+              min(_safe_float(marked['Open'].iloc[i]), _safe_float(marked['Close'].iloc[i])) -
+              _safe_float(marked['Low'].iloc[i]),
+              0.0
+          )
+
+      normalized = candle_range / atr if atr > 0 else 0.0
+
+      candidates.append(SwingCandidate(
+          id=swing_id,
+          type=swing_type,
+          price=price,
+          index=i,
+          timestamp=_bar_timestamp(marked, i),
+          strength=_swing_strength(marked, i, swing_type, left, right),
+          left_bars=left,
+          right_bars=right,
+          zone_high=zone.high,
+          zone_low=zone.low,
+          wick_size=round(wick, 8),
+          body_size=round(body, 8),
+          candle_range=round(candle_range, 8),
+          atr=round(atr, 8),
+          atr_normalized_size=round(normalized, 4),
+          liquidity_level=liquidity,
+          liquidity_source=source,
+          status=SwingStatus.CANDIDATE,
+          created_bar=i,
+          expires_bar=i + max(int(expiry_bars), 1),
+      ))
+  return candidates
+
+
+def detect_liquidity_interaction(df: pd.DataFrame, candidate: SwingCandidate,
+                                 bar_index: Optional[int] = None) -> LiquidityEvent:
+    """Classify the current bar's interaction with a swing/liquidity level."""
+    if df.empty:
+        return LiquidityEvent(candidate.id, candidate.type, candidate.liquidity_level or candidate.price,
+                              "", -1, reason="EMPTY_DATA")
+    i = len(df) - 1 if bar_index is None else int(bar_index)
+    if i < 0 or i >= len(df):
+        i = len(df) - 1
+    high = _safe_float(df['High'].iloc[i])
+    low = _safe_float(df['Low'].iloc[i])
+    close = _safe_float(df['Close'].iloc[i])
+    level = _safe_float(candidate.liquidity_level, candidate.price)
+    atr = max(_rolling_atr_at(df, i), candidate.atr, 1e-8)
+    penetration = max(level - low, 0.0) if candidate.type == SwingType.LOW else max(high - level, 0.0)
+    penetration_atr = penetration / atr
+    closed_beyond = close < level if candidate.type == SwingType.LOW else close > level
+    closed_back = close >= level if candidate.type == SwingType.LOW else close <= level
+    zone_reject = close >= candidate.zone_low if candidate.type == SwingType.LOW else close <= candidate.zone_high
+
+    if penetration <= 0:
+        interaction = LiquidityInteraction.NONE
+        valid = False
+        reason = "NO_LIQUIDITY_TAKE"
+    elif closed_back:
+        if penetration_atr >= 0.75:
+            interaction = LiquidityInteraction.DEEP_SWEEP
+        else:
+            interaction = LiquidityInteraction.WICK_SWEEP
+        valid = True
+        reason = "PENETRATION_AND_CLOSE_BACK"
+    elif closed_beyond:
+        interaction = LiquidityInteraction.BREAKDOWN if candidate.type == SwingType.LOW else LiquidityInteraction.BREAKOUT
+        valid = False
+        reason = "CONTINUATION_CLOSE_BEYOND_LEVEL"
+    else:
+        interaction = LiquidityInteraction.CLOSE_SWEEP
+        valid = False
+        reason = "AMBIGUOUS_CLOSE"
+
+    rejection = valid and zone_reject
+    quality = 0.0
+    if valid:
+        quality += 35.0
+        quality += min(25.0, penetration_atr * 20.0)
+        if rejection:
+            quality += 25.0
+        body = abs(_safe_float(df['Close'].iloc[i]) - _safe_float(df['Open'].iloc[i]))
+        candle_range = max(high - low, 1e-8)
+        close_strength = body / candle_range
+        quality += min(15.0, close_strength * 15.0)
+    quality = round(min(100.0, quality), 2)
+
+    return LiquidityEvent(
+        swing_id=candidate.id,
+        swing_type=candidate.type,
+        level=level,
+        timestamp=_bar_timestamp(df, i),
+        bar_index=i,
+        interaction=interaction,
+        penetration=round(penetration, 8),
+        penetration_atr=round(penetration_atr, 4),
+        closed_beyond=closed_beyond,
+        closed_back=closed_back,
+        rejection=rejection,
+        valid_sweep=valid,
+        quality=quality,
+        reason=reason,
+    )
+
+
+def phase11a_scan(df: pd.DataFrame, left: int = 3, right: int = 3,
+                  expiry_bars: int = 24) -> Dict[str, Any]:
+    """Non-trading Phase 11A scanner. It only observes; it never emits BUY/SELL."""
+    candidates = build_swing_candidates(df, left=left, right=right, expiry_bars=expiry_bars)
+    events = []
+    if not df.empty:
+        for candidate in candidates:
+            if candidate.expires_bar >= len(df) - 1:
+                event = detect_liquidity_interaction(df, candidate)
+                if event.interaction != LiquidityInteraction.NONE:
+                    events.append(event)
+    return {
+        "candidates": candidates,
+        "liquidity_events": events,
+        "signal": "NO TRADE",
+    }
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 4: SESSION DETECTION & ENTRY SCORING
+# ═══════════════════════════════════════════════════════════════════════
+def _market_time(dt: Optional[datetime] = None) -> datetime:
+    offset = getattr(settings, 'MARKET_TIMEZONE_OFFSET', 2)
+    base = dt or datetime.utcnow()
+    return base + timedelta(hours=offset)
+
+class Session(Enum):
+    ASIAN = "ASIAN"
+    LONDON = "LONDON"
+    LONDON_NY = "LONDON_NY"
+    NY = "NY"
+    NY_CLOSE = "NY_CLOSE"
+
+def detect_session(dt: Optional[datetime] = None) -> Session:
+    mt = _market_time(dt)
+    hour = mt.hour
+    if 0 <= hour < 7:
+        return Session.ASIAN
+    elif 7 <= hour < 12:
+        return Session.LONDON
+    elif 12 <= hour < 17:
+        return Session.LONDON_NY
+    elif 17 <= hour < 21:
+        return Session.NY
+    else:
+        return Session.NY_CLOSE
+
+def get_session_thresholds(session: Session, asian_auto_elevate: bool = False) -> Tuple[float, float]:
+    thresholds = {
+        Session.ASIAN: (0.82, 0.18),
+        Session.LONDON: (0.68, 0.32),
+        Session.LONDON_NY: (0.62, 0.38),
+        Session.NY: (0.65, 0.35),
+        Session.NY_CLOSE: (0.75, 0.25),
+    }
+    buy_thresh, sell_thresh = thresholds.get(session, (0.70, 0.30))
+    if session == Session.ASIAN and asian_auto_elevate:
+        buy_thresh = 0.85
+        sell_thresh = 0.15
+    return buy_thresh, sell_thresh
+
+@dataclass
+class ScoreResult:
+    long_prob: float = 0.0
+    short_prob: float = 0.0
+    decision: str = "NO SETUP"
+    long_score: float = 0.0
+    short_score: float = 0.0
+    details: Dict = field(default_factory=dict)
+
+def _get_col(df: pd.DataFrame, col: str, default: float = 0.0) -> float:
+    if col in df.columns and len(df) > 0:
+        return float(df[col].iloc[-1])
+    return default
+
+def evaluate_entry(htf_df: pd.DataFrame, itf_df: pd.DataFrame, ltf_df: pd.DataFrame,
+                   asian_auto_elevate: bool = False) -> ScoreResult:
+    result = ScoreResult()
+    if ltf_df.empty or htf_df.empty:
+        return result
+    htf_structure, _ = detect_bos_choch(htf_df)
+    ltf_structure, _ = detect_bos_choch(ltf_df)
+    htf_bullish = htf_structure in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH)
+    htf_bearish = htf_structure in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH)
+    ltf_bullish = ltf_structure in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH)
+    ltf_bearish = ltf_structure in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH)
+    ltf_bull_bos = ltf_structure == Structure.BULLISH_BOS
+    ltf_bear_bos = ltf_structure == Structure.BEARISH_BOS
+    current_price = float(ltf_df['Close'].iloc[-1])
+    pd_zone = _get_col(ltf_df, 'pd_zone', 0.5)
+    fvg_bull = bool(ltf_df.iloc[-1].get('fvg_bull', False)) and not bool(ltf_df.iloc[-1].get('fvg_bull_filled', True))
+    fvg_bear = bool(ltf_df.iloc[-1].get('fvg_bear', False)) and not bool(ltf_df.iloc[-1].get('fvg_bear_filled', True))
+    fvg_imbalance = _get_col(ltf_df, 'fvg_imbalance', 0.0)
+    sweep_signal = int(_get_col(ltf_df, 'sweep_signal', 0))
+    prev_high_20 = _get_col(ltf_df, 'prev_high_20', 0.0)
+    prev_low_20 = _get_col(ltf_df, 'prev_low_20', 0.0)
+    vwap = _get_col(ltf_df, 'vwap', current_price)
+    vp_poc = _get_col(ltf_df, 'vp_poc', 0.0)
+    vp_vah = _get_col(ltf_df, 'vp_vah', 0.0)
+    vp_val = _get_col(ltf_df, 'vp_val', 0.0)
+    delta_pct = _get_col(ltf_df, 'delta_pct', 0.0)
+    volume_ratio = _get_col(ltf_df, 'volume_ratio', 1.0)
+    atr = _get_col(ltf_df, 'atr', max(current_price * 0.001, 1e-8))
+
+    long_score = 0.0
+    long_details = {}
+    if htf_bullish:
+        long_score += 20
+        long_details['htf_bias'] = '+20'
+    if pd_zone < 0.30:
+        long_score += 15
+        long_details['pd_zone'] = '+15'
+    elif pd_zone < 0.45:
+        long_score += 10
+        long_details['pd_zone'] = '+10'
+    if ltf_structure in (Structure.BULLISH, Structure.BULLISH_CHOCH):
+        long_score += 15
+        long_details['ltf_structure'] = '+15'
+    elif ltf_bull_bos:
+        long_score += 10
+        long_details['ltf_structure'] = '+10'
+    if fvg_bull:
+        if fvg_imbalance > 0.2 * atr / current_price:
+            long_score += 10
+            long_details['fvg'] = '+10'
+        else:
+            long_score += 5
+            long_details['fvg'] = '+5'
+    if sweep_signal == -1 and current_price > prev_low_20:
+        long_score += 10
+        long_details['liquidity'] = '+10'
+    if current_price > vwap:
+        long_score += 10
+        long_details['vwap'] = '+10'
+    if vp_vah > 0 and current_price > vp_vah:
+        long_score += 10
+        long_details['volume_profile'] = '+10'
+    elif vp_poc > 0 and current_price > vp_poc:
+        long_score += 5
+        long_details['volume_profile'] = '+5'
+    if delta_pct > 0.20:
+        long_score += 5
+        long_details['delta'] = '+5'
+    if volume_ratio > 1.2:
+        long_score += 5
+        long_details['volume'] = '+5'
+    long_has_confluence = any([
+        fvg_bull,
+        bool(ltf_df.iloc[-1].get('bullish_ob', False)),
+        (sweep_signal == -1 and current_price > prev_low_20),
+        (current_price > vwap and vp_vah > 0 and current_price > vp_vah),
+    ])
+
+    short_score = 0.0
+    short_details = {}
+    if htf_bearish:
+        short_score += 20
+        short_details['htf_bias'] = '+20'
+    if pd_zone > 0.70:
+        short_score += 15
+        short_details['pd_zone'] = '+15'
+    elif pd_zone > 0.55:
+        short_score += 10
+        short_details['pd_zone'] = '+10'
+    if ltf_structure in (Structure.BEARISH, Structure.BEARISH_CHOCH):
+        short_score += 15
+        short_details['ltf_structure'] = '+15'
+    elif ltf_bear_bos:
+        short_score += 10
+        short_details['ltf_structure'] = '+10'
+    if fvg_bear:
+        if abs(fvg_imbalance) > 0.2 * atr / current_price:
+            short_score += 10
+            short_details['fvg'] = '+10'
+        else:
+            short_score += 5
+            short_details['fvg'] = '+5'
+    if sweep_signal == 1 and current_price < prev_high_20:
+        short_score += 10
+        short_details['liquidity'] = '+10'
+    if current_price < vwap:
+        short_score += 10
+        short_details['vwap'] = '+10'
+    if vp_val > 0 and current_price < vp_val:
+        short_score += 10
+        short_details['volume_profile'] = '+10'
+    elif vp_poc > 0 and current_price < vp_poc:
+        short_score += 5
+        short_details['volume_profile'] = '+5'
+    if delta_pct < -0.20:
+        short_score += 5
+        short_details['delta'] = '+5'
+    if volume_ratio > 1.2:
+        short_score += 5
+        short_details['volume'] = '+5'
+    short_has_confluence = any([
+        fvg_bear,
+        bool(ltf_df.iloc[-1].get('bearish_ob', False)),
+        (sweep_signal == 1 and current_price < prev_high_20),
+        (current_price < vwap and vp_val > 0 and current_price < vp_val),
+    ])
+
+    long_prob = long_score / 100.0
+    short_prob = short_score / 100.0
+    current_session = detect_session()
+    buy_thresh, sell_thresh = get_session_thresholds(current_session, asian_auto_elevate)
+    short_thresh = 1.0 - sell_thresh
+    decision = "NO SETUP"
+    if long_has_confluence and long_prob >= buy_thresh and long_prob > short_prob + 0.15:
+        decision = "BUY"
+    elif short_has_confluence and short_prob >= short_thresh and short_prob > long_prob + 0.15:
+        decision = "SELL"
+
+    result.long_prob = round(long_prob, 2)
+    result.short_prob = round(short_prob, 2)
+    result.long_score = long_score
+    result.short_score = short_score
+    result.decision = decision
+    result.details = {
+        "long": long_details,
+        "short": short_details,
+        "htf_structure": htf_structure.value,
+        "ltf_structure": ltf_structure.value,
+        "pd_zone": round(pd_zone, 2),
+        "session": current_session.value,
+        "buy_threshold": buy_thresh,
+        "sell_threshold": sell_thresh,
+        "short_threshold": short_thresh,
+        "long_has_confluence": long_has_confluence,
+        "short_has_confluence": short_has_confluence,
+    }
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 5: RISK MANAGER (ATR-BASED)
+# ═══════════════════════════════════════════════════════════════════════
+@dataclass
+class TradePlan:
+    valid: bool = False
+    direction: str = ""
+    entry: float = 0.0
+    sl: float = 0.0
+    tp: float = 0.0
+    position_size: float = 0.0
+    rr_ratio: float = 0.0
+    actual_risk: float = 0.0
+    reason: str = ""
+
+def get_symbol_specs(symbol: str) -> Dict:
+    fallback = {
+        "XAUUSD": {"contract_size": 100.0, "point_value": 0.01, "min_lot": 0.01, "lot_step": 0.01, "max_lot": 100.0, "tick_size": 0.01},
+        "BTCUSD": {"contract_size": 1.0, "point_value": 1.0, "min_lot": 0.01, "lot_step": 0.01, "max_lot": 100.0, "tick_size": 0.01},
+    }
+    base = dict(fallback.get(symbol, fallback["XAUUSD"]))
+    try:
+        info = mt5.get_symbol_info(symbol) if hasattr(mt5, "get_symbol_info") else None
+        if info:
+            base["contract_size"] = float(_field(info, "trade_contract_size", "contract_size", default=base["contract_size"]) or base["contract_size"])
+            base["min_lot"] = float(_field(info, "volume_min", "min_lot", default=base["min_lot"]) or base["min_lot"])
+            base["lot_step"] = float(_field(info, "volume_step", "lot_step", default=base["lot_step"]) or base["lot_step"])
+            base["max_lot"] = float(_field(info, "volume_max", "max_lot", default=base["max_lot"]) or base["max_lot"])
+            base["tick_size"] = float(_field(info, "trade_tick_size", "tick_size", default=base["tick_size"]) or base["tick_size"])
+    except Exception as e:
+        logger.debug(f"Symbol spec fallback for {symbol}: {e}")
+    return base
+
+def _get_atr(df: pd.DataFrame, period: int = 14) -> float:
+    if df is None or df.empty:
+        return 0.0
+    if 'atr' in df.columns:
+        return float(df['atr'].iloc[-1])
+    if 'candle_range' in df.columns:
+        return float(df['candle_range'].rolling(period).mean().iloc[-1])
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
+
+def calculate_position_size(symbol: str, entry: float, sl: float, balance: float, risk_pct: float = 0.01) -> float:
+    specs = get_symbol_specs(symbol)
+    risk_pct = min(max(float(risk_pct), 0.0), float(getattr(settings, "MAX_RISK_PER_TRADE_PCT", 0.01)))
+    risk_amount = max(float(balance), 0.0) * risk_pct
+    sl_distance = abs(float(entry) - float(sl))
+    if risk_amount <= 0 or sl_distance <= 1e-8:
+        return 0.0
+    contract = float(specs["contract_size"])
+    raw = risk_amount / (sl_distance * contract)
+    step = max(float(specs["lot_step"]), 1e-8)
+    min_lot = float(specs["min_lot"])
+    max_lot = float(specs["max_lot"])
+    lots = math.floor(raw / step + 1e-12) * step
+    lots = round(min(lots, max_lot), 8)
+    if lots < min_lot:
+        min_risk = min_lot * sl_distance * contract
+        logger.warning(f"⛔ RISK SIZE REJECTED | {symbol} min lot {min_lot} risks ${min_risk:.2f} > allowed ${risk_amount:.2f}")
+        return 0.0
+    return lots
+
+def calculate_sl_tp(direction: str, entry: float, ltf_df: pd.DataFrame, htf_df: pd.DataFrame,
+                    atr_mult_sl: float = 1.5, atr_mult_tp: float = 2.5) -> Tuple[float, float]:
+    if ltf_df.empty or htf_df.empty:
+        return entry * 0.99, entry * 1.01
+    atr = _get_atr(ltf_df)
+    if atr <= 0:
+        atr = max(abs(entry) * 0.002, 0.01)
+    recent_low = float(ltf_df['Low'].tail(5).min())
+    recent_high = float(ltf_df['High'].tail(5).max())
+    swing_lows = float(ltf_df['Low'].rolling(3).min().shift(1).tail(3).min())
+    swing_highs = float(ltf_df['High'].rolling(3).max().shift(1).tail(3).max())
+    htf_resistance = float(htf_df['High'].tail(20).max()) if not htf_df.empty else entry * 1.02
+    htf_support = float(htf_df['Low'].tail(20).min()) if not htf_df.empty else entry * 0.98
+    if direction == "BUY":
+        structure_sl = min(recent_low, swing_lows)
+        htf_sl = htf_support * 0.998
+        structure_sl = min(structure_sl, htf_sl)
+        atr_sl = entry - (atr * atr_mult_sl)
+        sl = max(structure_sl, atr_sl)
+        risk = abs(entry - sl)
+        atr_tp = entry + (atr * atr_mult_tp)
+        min_tp = entry + (risk * 2.0)
+        htf_tp = htf_resistance
+        tp = max(atr_tp, min_tp, htf_tp)
+    else:
+        structure_sl = max(recent_high, swing_highs)
+        htf_sl = htf_resistance * 1.002
+        structure_sl = max(structure_sl, htf_sl)
+        atr_sl = entry + (atr * atr_mult_sl)
+        sl = min(structure_sl, atr_sl)
+        risk = abs(entry - sl)
+        atr_tp = entry - (atr * atr_mult_tp)
+        min_tp = entry - (risk * 2.0)
+        htf_tp = htf_support
+        tp = min(atr_tp, min_tp, htf_tp)
+    return round(sl, 2), round(tp, 2)
+
+def validate_trade(direction: str, entry: float, sl: float, tp: float, balance: float, symbol: str,
+                   allow_no_tp: bool = False) -> TradePlan:
+    plan = TradePlan()
+    risk = abs(entry - sl)
+    if risk < 1e-8:
+        plan.reason = "Invalid SL distance"
+        return plan
+    if allow_no_tp or tp <= 0:
+        rr = 2.0
+    else:
+        reward = abs(tp - entry)
+        rr = reward / risk
+        if rr < settings.MIN_RR_RATIO:
+            plan.reason = f"R:R {rr:.2f} < {settings.MIN_RR_RATIO}"
+            return plan
+    position_size = calculate_position_size(symbol, entry, sl, balance, settings.RISK_PER_TRADE_PCT)
+    if position_size <= 0:
+        plan.reason = "Minimum broker lot would exceed configured risk"
+        return plan
+    specs = get_symbol_specs(symbol)
+    actual_risk = position_size * risk * float(specs["contract_size"])
+    max_risk = balance * min(float(settings.RISK_PER_TRADE_PCT), float(getattr(settings, "MAX_RISK_PER_TRADE_PCT", 0.01)))
+    if actual_risk > max_risk * 1.001:
+        plan.reason = f"Actual risk ${actual_risk:.2f} exceeds max ${max_risk:.2f}"
+        return plan
+    plan.valid = True
+    plan.direction = direction
+    plan.entry = entry
+    plan.sl = sl
+    plan.tp = tp
+    plan.position_size = position_size
+    plan.rr_ratio = round(rr, 2)
+    plan.actual_risk = round(actual_risk, 2)
+    return plan
+
+def calculate_trailing_sl(direction: str, current_sl: float, entry: float, df: pd.DataFrame, current_r: float) -> Tuple[float, bool]:
+    if df.empty or current_r < 1.5:
+        return current_sl, False
+    atr = _get_atr(df)
+    if atr <= 0:
+        atr = abs(entry) * 0.002
+    atr_mult = atr * 0.5
+    if direction == "BUY":
+        recent_swing_low = float(df['Low'].tail(5).min())
+        new_sl = max(recent_swing_low - atr_mult, entry)
+        if new_sl > current_sl:
+            return round(new_sl, 2), True
+    else:
+        recent_swing_high = float(df['High'].tail(5).max())
+        new_sl = min(recent_swing_high + atr_mult, entry)
+        if new_sl < current_sl:
+            return round(new_sl, 2), True
+    return current_sl, False
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 6: SPREAD FILTER (POINTS-BASED)
+# ═══════════════════════════════════════════════════════════════════════
+def _get_symbol_point(symbol: str) -> float:
+    try:
+        info = mt5.get_symbol_info(symbol) if hasattr(mt5, "get_symbol_info") else None
+        if info:
+            point = _field(info, "point", "trade_tick_size", "tick_size", default=None)
+            if point is not None and float(point) > 0:
+                return float(point)
+    except Exception:
+        pass
+    if symbol == "XAUUSD":
+        return 0.01
+    elif symbol == "BTCUSD":
+        return 0.01
+    return 0.01
+
+def _price_diff_to_points(price_diff: float, symbol: str) -> float:
+    point = _get_symbol_point(symbol)
+    if point <= 0:
+        return price_diff
+    return price_diff / point
+
+def get_current_spread(symbol: str) -> float:
+    try:
+        if hasattr(mt5, 'get_spread'):
+            spread = mt5.get_spread(symbol)
+            if spread is not None:
+                return float(spread)
+        if hasattr(mt5, 'get_symbol_info'):
+            info = mt5.get_symbol_info(symbol)
+            if info is not None:
+                spread = _field(info, "spread", default=None)
+                if spread is not None:
+                    return float(spread)
+        if hasattr(mt5, 'get_last_tick'):
+            tick = mt5.get_last_tick(symbol)
+            if tick is not None:
+                ask = _field(tick, "ask", default=0.0)
+                bid = _field(tick, "bid", default=0.0)
+                if ask and bid:
+                    return _price_diff_to_points(float(ask) - float(bid), symbol)
+        if hasattr(mt5, 'terminal'):
+            terminal = mt5.terminal()
+            if terminal and hasattr(terminal, 'symbol_info_tick'):
+                tick = terminal.symbol_info_tick(symbol)
+                if tick is not None:
+                    ask = _field(tick, "ask", default=0.0)
+                    bid = _field(tick, "bid", default=0.0)
+                    if ask and bid:
+                        return _price_diff_to_points(float(ask) - float(bid), symbol)
+    except Exception as e:
+        logger.warning(f"Spread fetch failed: {e}")
+    return 0.0
+
+def get_spread_limit(symbol: str, atr: Optional[float] = None) -> float:
+    if symbol == "XAUUSD":
+        base_limit = float(getattr(settings, 'SPREAD_LIMIT_GOLD', 5.0))
+    elif symbol == "BTCUSD":
+        base_limit = float(getattr(settings, 'SPREAD_LIMIT_BTC', 50.0))
+    else:
+        base_limit = 5.0
+    if atr is not None and atr > 0:
+        dynamic_mult = min(max(atr / 3.0, 1.0), 2.0) if symbol == "XAUUSD" else 1.0
+        base_limit = base_limit * dynamic_mult
+    return round(base_limit, 2)
+
+def check_spread_filter(symbol: str, ltf_df: Optional[pd.DataFrame] = None) -> Dict:
+    spread = get_current_spread(symbol)
+    atr = _get_atr(ltf_df) if ltf_df is not None and not ltf_df.empty else None
+    limit = get_spread_limit(symbol, atr=atr)
+    state.current_spread = spread
+    if spread <= 0:
+        allowed = bool(getattr(settings, "ALLOW_UNVERIFIED_SPREAD", False))
+        return {"allowed": allowed, "spread": round(spread, 2), "limit": limit,
+                "reason": "Spread unavailable — entry blocked" if not allowed else "Spread unavailable but allowed"}
+    if spread > limit:
+        return {"allowed": False, "spread": round(spread, 2), "limit": limit,
+                "reason": f"SPREAD TOO HIGH | {spread:.1f} > {limit:.1f}"}
+    return {"allowed": True, "spread": round(spread, 2), "limit": limit,
+            "reason": f"Spread OK | {spread:.1f}/{limit:.1f}"}
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 7: MULTI-TIMEFRAME DATA FETCH
+# ═══════════════════════════════════════════════════════════════════════
+TF_MAP = {"5M": "M5", "15M": "M15", "1H": "H1", "4H": "H4"}
+
+def fetch_and_build(symbol: str, timeframe_key: str, bars: Optional[int] = None) -> pd.DataFrame:
+    if bars is None:
+        bars = getattr(settings, 'DATA_BARS', 200)
+    try:
+        tf = TF_MAP.get(timeframe_key, timeframe_key)
+        df = mt5.fetch_rates(symbol, tf, bars)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        rename_map = {}
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower == 'open':
+                rename_map[col] = 'Open'
+            elif col_lower == 'high':
+                rename_map[col] = 'High'
+            elif col_lower == 'low':
+                rename_map[col] = 'Low'
+            elif col_lower == 'close':
+                rename_map[col] = 'Close'
+            elif col_lower == 'volume':
+                rename_map[col] = 'Volume'
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        required = {"Open", "High", "Low", "Close"}
+        if not required.issubset(set(df.columns)):
+            logger.warning(f"fetch_and_build: missing required columns for {symbol} {timeframe_key}")
+            return pd.DataFrame()
+        if len(df) < 30:
+            logger.warning(f"fetch_and_build: insufficient rows ({len(df)}) for {symbol} {timeframe_key}")
+            return pd.DataFrame()
+        return build_smc_features(df)
+    except Exception as e:
+        logger.error(f"fetch_and_build failed [{symbol} {timeframe_key}]: {e}")
+        return pd.DataFrame()
+
+def get_multi_timeframe_data(symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    bars = getattr(settings, 'DATA_BARS', 200)
+    htf_df = fetch_and_build(symbol, "4H", bars)
+    itf_df = fetch_and_build(symbol, "1H", bars)
+    ltf_df = fetch_and_build(symbol, "5M", bars)
+    return htf_df, itf_df, ltf_df
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 8: ADVANCED INSTITUTIONAL FEATURES
+# ═══════════════════════════════════════════════════════════════════════
+def detect_liquidity_pools(df: pd.DataFrame, tolerance_pct: Optional[float] = None,
+                           atr_mult: float = 0.25) -> Dict:
+    if df.empty or len(df) < 10:
+        return {"eqh": [], "eql": []}
+    if tolerance_pct is None:
+        atr = _get_atr(df)
+        if atr > 0:
+            current_price = float(df['Close'].iloc[-1])
+            tolerance_pct = min(max(atr_mult * atr / current_price, 0.0001), 0.005)
+        else:
+            tolerance_pct = 0.0008
+    highs = df['High'].tail(30).values
+    lows = df['Low'].tail(30).values
+    eqh, eql = [], []
+    high_diff = np.abs(highs[:, None] - highs[None, :])
+    low_diff = np.abs(lows[:, None] - lows[None, :])
+    np.fill_diagonal(high_diff, np.inf)
+    np.fill_diagonal(low_diff, np.inf)
+    high_matches = high_diff < (tolerance_pct * np.maximum(highs[:, None], 1e-8))
+    low_matches = low_diff < (tolerance_pct * np.maximum(lows[:, None], 1e-8))
+    if high_matches.any():
+        for i, j in zip(*np.where(high_matches)):
+            eqh.append(round(float((highs[i] + highs[j]) / 2), 2))
+    if low_matches.any():
+        for i, j in zip(*np.where(low_matches)):
+            eql.append(round(float((lows[i] + lows[j]) / 2), 2))
+    return {"eqh": sorted(set(eqh))[-5:], "eql": sorted(set(eql))[:5]}
+
+def calculate_session_volume_profile(df: pd.DataFrame, window: int = 30) -> Dict:
+    if df.empty or len(df) < max(window, 5):
+        return {"poc": 0.0, "vah": 0.0, "val": 0.0}
+    recent = df.tail(window).copy()
+    if 'Volume' not in recent.columns:
+        recent['Volume'] = 1.0
+    if recent['Volume'].sum() <= 0:
+        recent['Volume'] = 1.0
+    close_prices = recent['Close'].astype(float)
+    try:
+        counts, bin_edges = np.histogram(close_prices, bins=min(20, len(close_prices)))
+        if counts.sum() == 0:
+            return {"poc": 0.0, "vah": 0.0, "val": 0.0}
+        bin_indices = np.digitize(close_prices, bin_edges[1:-1])
+        vol_by_bin = [recent['Volume'].values[bin_indices == i].sum() for i in range(len(counts))]
+        if len(vol_by_bin) != len(counts):
+            return {"poc": 0.0, "vah": 0.0, "val": 0.0}
+        total_vol = sum(vol_by_bin)
+        if total_vol <= 0:
+            return {"poc": 0.0, "vah": 0.0, "val": 0.0}
+        max_idx = int(np.argmax(vol_by_bin))
+        poc = float((bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2.0)
+        cum_vol = 0.0
+        included_mids = []
+        for idx in sorted(range(len(counts)), key=lambda i: abs(i - max_idx)):
+            cum_vol += vol_by_bin[idx]
+            included_mids.append((bin_edges[idx] + bin_edges[idx + 1]) / 2.0)
+            if cum_vol >= total_vol * 0.68:
+                break
+        vah = float(max(included_mids)) if included_mids else poc
+        val = float(min(included_mids)) if included_mids else poc
+        return {"poc": round(poc, 2), "vah": round(vah, 2), "val": round(val, 2)}
+    except Exception as e:
+        logger.warning(f"Volume profile calc failed: {e}")
+        return {"poc": 0.0, "vah": 0.0, "val": 0.0}
+
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
+    if df.empty or len(df) < period * 2:
+        return 20.0
+    try:
+        high = df['High'].astype(float)
+        low = df['Low'].astype(float)
+        close = df['Close'].astype(float)
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        plus_dm = pd.Series(plus_dm, index=df.index)
+        minus_dm = pd.Series(minus_dm, index=df.index)
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        plus_di = 100 * (plus_dm.rolling(period).mean() / atr.clip(lower=1e-8))
+        minus_di = 100 * (minus_dm.rolling(period).mean() / atr.clip(lower=1e-8))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).clip(lower=1e-8)
+        adx = dx.rolling(period).mean()
+        val = adx.iloc[-1]
+        return float(val) if not math.isnan(val) else 20.0
+    except Exception as e:
+        logger.warning(f"ADX calc failed: {e}")
+        return 20.0
+
+def check_market_regime(df: pd.DataFrame) -> Dict:
+    if not getattr(settings, 'MARKET_REGIME_DETECT', True):
+        return {"regime": "TRENDING", "adx": 25.0, "size_multiplier": 1.0}
+    adx = calculate_adx(df)
+    threshold = getattr(settings, 'ADX_TREND_THRESHOLD', 25.0)
+    atr_pctile = float(df['atr_pctile'].iloc[-1]) if 'atr_pctile' in df.columns else 0.5
+    if atr_pctile > 0.7:
+        threshold = threshold * 1.2
+    if adx < threshold:
+        return {"regime": "RANGING", "adx": round(adx, 1), "size_multiplier": 0.5}
+    return {"regime": "TRENDING", "adx": round(adx, 1), "size_multiplier": 1.0}
+
+def get_dxy_bias() -> Optional[Structure]:
+    if not getattr(settings, 'DXY_CORRELATION', False):
+        return None
+    dxy_symbol = getattr(settings, 'DXY_SYMBOL', 'DXY')
+    dxy_tf = getattr(settings, 'DXY_TIMEFRAME', '1H')
+    try:
+        dxy_df = fetch_and_build(dxy_symbol, dxy_tf, 100)
+        if dxy_df.empty:
+            return None
+        structure, _ = detect_bos_choch(dxy_df)
+        return structure
+    except Exception as e:
+        logger.warning(f"DXY fetch failed: {e}")
+        return None
+
+def apply_dxy_confluence(score_result: ScoreResult, dxy_structure: Optional[Structure]) -> ScoreResult:
+    if dxy_structure is None:
+        return score_result
+    dxy_bearish = dxy_structure in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH)
+    dxy_bullish = dxy_structure in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH)
+    if dxy_bearish:
+        score_result.long_score += 10
+        score_result.long_prob = round(score_result.long_score / 100.0, 2)
+        score_result.details.setdefault('long', {})['dxy'] = '+10'
+    if dxy_bullish:
+        score_result.short_score += 10
+        score_result.short_prob = round(score_result.short_score / 100.0, 2)
+        score_result.details.setdefault('short', {})['dxy'] = '+10'
+    return score_result
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 9: ML ENGINE (XGBOOST + ADVANCED LABELING)
+# ═══════════════════════════════════════════════════════════════════════
+ML_FEATURE_COLUMNS = [
+    'delta', 'cvd_divergence', 'wick_absorption', 'sweep_signal',
+    'fvg_imbalance', 'volatility_squeeze', 'vsa_anomaly', 'vwap_dev',
+    'pd_zone',
+    'vwap_upper_1', 'vwap_lower_1', 'vp_poc', 'vp_vah', 'vp_val',
+    'near_pool_high', 'near_pool_low', 'volume_ratio', 'atr_pctile',
+]
+
+class MLEngine:
+    def __init__(self):
+        self.models = {}
+        self.calibrators = {}
+        self.ready = False
+        self.feature_importances = {}
+        self.last_training_stats = {}
+        self.drift_psi = None
+
+    def _add_advanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        d = df.copy()
+        for col in ML_FEATURE_COLUMNS:
+            if col not in d.columns:
+                d[col] = 0.0
+        return d
+
+    def _triple_barrier_labels(self, df: pd.DataFrame, horizon: int = 6,
+                               atr_mult: float = 2.0) -> pd.DataFrame:
+        d = df.copy()
+        if 'atr' not in d.columns:
+            d['atr'] = (d['High'] - d['Low']).rolling(14).mean().fillna(0.001)
+        atr = d['atr']
+        close = d['Close'].values
+        high = d['High'].values
+        low = d['Low'].values
+        n = len(d)
+        targets = np.full(n, -1, dtype=int)
+        for i in range(n - horizon):
+            entry = close[i]
+            barrier_up = entry + atr.iloc[i] * atr_mult
+            barrier_dn = entry - atr.iloc[i] * atr_mult
+            future_high = high[i+1:i+horizon+1].max() if i+horizon+1 <= n else high[i+1:].max()
+            future_low = low[i+1:i+horizon+1].min() if i+horizon+1 <= n else low[i+1:].min()
+            if future_high >= barrier_up:
+                targets[i] = 1
+            elif future_low <= barrier_dn:
+                targets[i] = 0
+        d['target'] = targets
+        return d
+
+    def _prepare_data(self, df: pd.DataFrame, symbol: str = "XAUUSD") -> Optional[pd.DataFrame]:
+        if df.empty:
+            return None
+        df = self._add_advanced_features(df)
+        df = self._triple_barrier_labels(df,
+                                         horizon=getattr(settings, 'TRIPLE_BARRIER_HORIZON', 6),
+                                         atr_mult=getattr(settings, 'TRIPLE_BARRIER_ATR_MULT', 2.0))
+        df = df[df['target'] != -1].copy()
+        return df
+
+    def train(self, df: pd.DataFrame, symbol: str = None) -> bool:
+        if not XGBOOST_AVAILABLE or not getattr(settings, 'ENABLE_ML_ENGINE', True):
+            return False
+        symbol = symbol or getattr(state, 'current_symbol', 'XAUUSD')
+        try:
+            data = self._prepare_data(df, symbol)
+            if data is None or len(data) < getattr(settings, 'ML_MIN_SAMPLES', 50):
+                logger.info(f"🤖 ML training skipped | symbol:{symbol} samples:{0 if data is None else len(data)} < min")
+                return False
+            feature_cols = [c for c in ML_FEATURE_COLUMNS if c in data.columns]
+            if not feature_cols:
+                return False
+            X = data[feature_cols].fillna(0).values
+            y = data['target'].astype(int).values
+            split = int(len(X) * 0.8)
+            X_train, X_val = X[:split], X[split:]
+            y_train, y_val = y[:split], y[split:]
+            n_pos = max((y_train == 1).sum(), 1)
+            n_neg = max((y_train == 0).sum(), 1)
+            scale_pos_weight = n_neg / n_pos
+            models = {}
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=200, max_depth=5, learning_rate=0.03,
+                scale_pos_weight=scale_pos_weight, subsample=0.8,
+                colsample_bytree=0.8, eval_metric='logloss',
+                
+            )
+            xgb_model.fit(X_train, y_train)
+            models['xgb'] = xgb_model
+            if LGBM_AVAILABLE and getattr(settings, 'ML_ENSEMBLE_WEIGHTS', {}).get('lgbm', 0) > 0:
+                lgb_model = lgb.LGBMClassifier(
+                    n_estimators=200, max_depth=5, learning_rate=0.03,
+                    subsample=0.8, colsample_bytree=0.8,
+                )
+                lgb_model.fit(X_train, y_train)
+                models['lgbm'] = lgb_model
+            if CATBOOST_AVAILABLE and getattr(settings, 'ML_ENSEMBLE_WEIGHTS', {}).get('cat', 0) > 0:
+                cat_model = cb.CatBoostClassifier(
+                    iterations=200, depth=5, learning_rate=0.03,
+                    verbose=False,
+                )
+                cat_model.fit(X_train, y_train)
+                models['cat'] = cat_model
+            self.models[symbol] = models
+            self.feature_importances[symbol] = xgb_model.feature_importances_.tolist()
+            if SKLEARN_AVAILABLE and len(X_val) > 10:
+                xgb_probs = xgb_model.predict_proba(X_val)[:, 1]
+                calibrator = IsotonicRegression(out_of_bounds='clip')
+                calibrator.fit(xgb_probs, y_val)
+                self.calibrators[symbol] = calibrator
+            else:
+                self.calibrators[symbol] = None
+            val_pred = xgb_model.predict(X_val)
+            val_acc = float((val_pred == y_val).mean()) if len(y_val) > 0 else 0.0
+            self.last_training_stats[symbol] = {
+                'samples': len(X), 'val_samples': len(X_val),
+                'val_acc': round(val_acc, 3),
+                'pos': int(n_pos), 'neg': int(n_neg),
+                'time': datetime.now().isoformat()
+            }
+            self.ready = True
+            state.ml_model_ready = True
+            state.last_ml_train_time = datetime.now().isoformat()
+            logger.info(f"🤖 ML MODEL TRAINED | symbol:{symbol} samples:{len(X)} val_acc:{val_acc:.3f} pos:{n_pos} neg:{n_neg}")
+            self.save(symbol)
+            return True
+        except Exception as e:
+            logger.error(f"ML training failed: {e}", exc_info=True)
+            self.ready = False
+            state.ml_model_ready = False
+            return False
+
+    def _ensemble_predict_proba(self, symbol: str, X) -> Optional[float]:
+        if symbol not in self.models:
+            return None
+        weights = getattr(settings, 'ML_ENSEMBLE_WEIGHTS', {'xgb': 1.0})
+        total_weight = 0.0
+        prob_sum = 0.0
+        for name, model in self.models[symbol].items():
+            if hasattr(model, 'predict_proba'):
+                try:
+                    prob = model.predict_proba(X)[:, 1]
+                    w = weights.get(name, 0.0)
+                    prob_sum += prob * w
+                    total_weight += w
+                except Exception:
+                    pass
+        if total_weight <= 0:
+            return None
+        return float(prob_sum / total_weight)
+
+    def predict_prob(self, df: pd.DataFrame, symbol: str = None) -> Optional[float]:
+        symbol = symbol or getattr(state, 'current_symbol', 'XAUUSD')
+        if not self.ready or symbol not in self.models or df.empty:
+            return None
+        try:
+            data = self._add_advanced_features(df)
+            feature_cols = [c for c in ML_FEATURE_COLUMNS if c in data.columns]
+            if not feature_cols:
+                return None
+            X = data[feature_cols].fillna(0).iloc[[-1]].values
+            raw_prob = self._ensemble_predict_proba(symbol, X)
+            if raw_prob is None:
+                return None
+            calibrator = self.calibrators.get(symbol)
+            if calibrator is not None:
+                calibrated = calibrator.predict(np.array([raw_prob]))[0]
+                return float(np.clip(calibrated, 0.0, 1.0))
+            return float(raw_prob)
+        except Exception as e:
+            logger.warning(f"ML predict failed: {e}")
+            return None
+
+    def save(self, symbol: str = None) -> None:
+        symbol = symbol or getattr(state, 'current_symbol', 'XAUUSD')
+        try:
+            Path("models").mkdir(exist_ok=True)
+            if symbol in self.models:
+                with open(f"models/ml_{symbol}.pkl", "wb") as f:
+                    pickle.dump({
+                        'models': self.models[symbol],
+                        'calibrator': self.calibrators.get(symbol),
+                        'features': ML_FEATURE_COLUMNS,
+                        'stats': self.last_training_stats.get(symbol, {})
+                    }, f)
+                logger.info(f"💾 ML model saved | symbol:{symbol}")
+        except Exception as e:
+            logger.error(f"ML model save failed: {e}")
+
+    def load(self, symbol: str = None) -> bool:
+        symbol = symbol or getattr(state, 'current_symbol', 'XAUUSD')
+        path = Path(f"models/ml_{symbol}.pkl")
+        if not path.exists():
+            return False
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            self.models[symbol] = data['models']
+            self.calibrators[symbol] = data['calibrator']
+            self.last_training_stats[symbol] = data.get('stats', {})
+            self.ready = True
+            state.ml_model_ready = True
+            logger.info(f"📂 ML model loaded | symbol:{symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"ML model load failed: {e}")
+            return False
+
+ml_engine = MLEngine()
+
+def blend_score_with_ml(score_result: ScoreResult, ltf_df: pd.DataFrame) -> ScoreResult:
+    ml_prob = ml_engine.predict_prob(ltf_df)
+    if ml_prob is None:
+        return score_result
+    rule_w = getattr(settings, 'RULE_WEIGHT', 0.70)
+    ml_w = getattr(settings, 'ML_WEIGHT', 0.30)
+    blended_long = round(score_result.long_prob * rule_w + ml_prob * ml_w, 2)
+    blended_short = round(score_result.short_prob * rule_w + (1 - ml_prob) * ml_w, 2)
+    score_result.long_prob = max(0.0, min(1.0, blended_long))
+    score_result.short_prob = max(0.0, min(1.0, blended_short))
+    score_result.details['ml_prob'] = round(ml_prob, 3)
+    session = detect_session()
+    buy_thresh, sell_thresh = get_session_thresholds(session, getattr(settings, "ASIAN_AUTO_ELEVATE", False))
+    short_thresh = 1.0 - sell_thresh
+    score_result.decision = "NO SETUP"
+    if score_result.long_prob >= buy_thresh and score_result.long_prob > score_result.short_prob + 0.15:
+        score_result.decision = "BUY"
+    elif score_result.short_prob >= short_thresh and score_result.short_prob > score_result.long_prob + 0.15:
+        score_result.decision = "SELL"
+    score_result.details["final_decision_after_ml"] = score_result.decision
+    return score_result
+
+async def ml_retrain_loop():
+    while state.running:
+        try:
+            if getattr(settings, 'ENABLE_ML_ENGINE', True) and XGBOOST_AVAILABLE:
+                symbol = get_symbol_for_datetime(datetime.now())
+                df = fetch_and_build(symbol, "5M", 500)
+                if not df.empty:
+                    ml_engine.train(df, symbol)
+        except Exception as e:
+            logger.error(f"ML retrain loop error: {e}")
+        await asyncio.sleep(getattr(settings, 'ML_RETRAIN_HOURS', 6) * 3600)
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 10: NOTIFICATION SYSTEM
+# ═══════════════════════════════════════════════════════════════════════
+def _escape_html(text: str) -> str:
+    return html.escape(str(text))
+
+def _truncate_text(text: str, max_len: int = 4000) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
+async def _post_with_retry(client, url, payload, max_retries=3, backoff=1.0):
+    for attempt in range(max_retries):
+        try:
+            response = await client.post(url, json=payload, timeout=10)
+            if response.status_code < 400:
+                return True
+            else:
+                logger.warning(f"Notification failed [{url}] status {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.warning(f"Notification attempt {attempt+1} failed: {e}")
+        if attempt < max_retries - 1:
+            await asyncio.sleep(backoff * (2 ** attempt))
+    return False
+
+async def send_telegram(message: str):
+    if not getattr(settings, 'ENABLE_TELEGRAM_ALERTS', False) or httpx is None:
+        return
+    token = getattr(settings, 'TELEGRAM_BOT_TOKEN', '')
+    chat_id = getattr(settings, 'TELEGRAM_CHAT_ID', '')
+    if not token or not chat_id:
+        return
+    message = _truncate_text(_escape_html(message), 4000)
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        async with httpx.AsyncClient() as client:
+            await _post_with_retry(client, url, {"chat_id": chat_id, "text": message, "parse_mode": "HTML"})
+    except Exception as e:
+        logger.warning(f"Telegram alert failed: {e}")
+
+async def send_discord(message: str):
+    if not getattr(settings, 'ENABLE_DISCORD_ALERTS', False) or httpx is None:
+        return
+    webhook = getattr(settings, 'DISCORD_WEBHOOK_URL', '')
+    if not webhook:
+        return
+    message = _truncate_text(message, 1900)
+    try:
+        async with httpx.AsyncClient() as client:
+            await _post_with_retry(client, webhook, {"content": message})
+    except Exception as e:
+        logger.warning(f"Discord alert failed: {e}")
+
+async def notify(message: str):
+    results = await asyncio.gather(send_telegram(message), send_discord(message), return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception):
+            logger.warning(f"Notify error: {res}")
+
+def format_entry_alert(plan: TradePlan, symbol: str, score: ScoreResult, session: str) -> str:
+    return (f"🎯 <b>ENTRY</b> | {symbol} {plan.direction}\n"
+            f"Entry: {plan.entry:.2f} | SL: {plan.sl:.2f} | TP: {plan.tp:.2f}\n"
+            f"Size: {plan.position_size} lots | R:R {plan.rr_ratio}\n"
+            f"Score: L{score.long_score}/S{score.short_score} | Session: {session}\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+def format_exit_alert(trade: Dict, exit_price: float, r_multiple: float, pnl: float, reason: str) -> str:
+    return (f"🏁 <b>EXIT</b> | {state.current_symbol} {trade['direction']}\n"
+            f"Entry: {trade['entry']:.2f} -> Exit: {exit_price:.2f}\n"
+            f"R-Multiple: {r_multiple:+.2f}R | PnL: {pnl:+.2f}$\n"
+            f"Reason: {reason}\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+def format_daily_summary() -> str:
+    total_closed = state.daily_wins + state.daily_losses + state.daily_be
+    win_rate = (state.daily_wins / max(total_closed, 1)) * 100
+    return (f"📊 <b>DAILY SUMMARY</b>\n"
+            f"Trades: {state.daily_trades} | Win Rate: {win_rate:.1f}%\n"
+            f"Total R: {state.total_r:+.2f} | Balance: ${state.balance:.2f}\n"
+            f"Max DD: {state.max_drawdown:.2f}%")
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 11: TRADE MANAGEMENT & EXECUTION
+# ═══════════════════════════════════════════════════════════════════════
+def update_trading_mode():
+    threshold = getattr(settings, 'MODE_SWITCH_BALANCE', 100.0)
+    new_mode = "SPLIT_ENTRY" if state.balance >= threshold else "SINGLE_TRADE"
+    if new_mode != state.mode:
+        logger.info(f"🔀 MODE SWITCH | {state.mode} -> {new_mode} | Balance: ${state.balance:.2f}")
+        state.mode = new_mode
+
+def get_max_open_positions() -> int:
+    return 2 if state.mode == "SPLIT_ENTRY" else 1
+
+ORDER_TYPE_MAP = {"BUY": 0, "SELL": 1}
+
+def _normalize_order_type(direction: str):
+    return ORDER_TYPE_MAP.get(direction, direction)
+
+def _check_slippage(symbol: str, direction: str, requested_price: float, filled_price: float) -> bool:
+    if requested_price <= 0 or filled_price <= 0:
+        return True
+    max_slippage_points = float(getattr(settings, 'MAX_SLIPPAGE_POINTS', 100))
+    point = _get_symbol_point(symbol)
+    allowed_price_diff = max_slippage_points * point
+    diff = abs(filled_price - requested_price)
+    if diff > allowed_price_diff:
+        logger.warning(f"⚠️ SLIPPAGE VIOLATION | {symbol} {direction} req:{requested_price} fill:{filled_price} diff:{diff:.2f} max:{allowed_price_diff:.2f}")
+        return False
+    return True
+
+def send_market_order(symbol: str, direction: str, size: float, sl: float, tp: float,
+                       magic: int = MAGIC_SINGLE, comment: str = "SMCv4.1",
+                       requested_price: Optional[float] = None) -> Dict:
+    try:
+        if not state.mt5_connected:
+            return {"success": False, "error": "MT5 disconnected"}
+        if size <= 0:
+            return {"success": False, "error": "Invalid position size"}
+        order_type = _normalize_order_type(direction)
+        result = mt5.send_order(symbol=symbol, order_type=order_type, volume=size,
+                                sl=sl, tp=(tp if tp else 0.0), magic=magic, comment=comment)
+        if result is None:
+            return {"success": False, "error": "No broker response"}
+        retcode = int(_field(result, "retcode", default=-1) or -1)
+        if retcode not in (0, 10008, 10009, 10010):
+            msg = str(_field(result, "comment", "message", default="Broker rejected order"))
+            logger.error(f"❌ ORDER REJECTED | {symbol} {direction} | retcode:{retcode} | {msg}")
+            return {"success": False, "error": msg, "retcode": retcode}
+        ticket = _field(result, "position", "order", "ticket", default=None)
+        fill_price = float(_field(result, "price", "price_open", default=0) or 0)
+        if fill_price <= 0:
+            fill_price = entry_fallback(symbol, direction)
+        positions = get_open_mt5_positions()
+        candidates = []
+        for p in positions:
+            pos_magic = _field(p, "magic", default=None)
+            pos_symbol = str(_field(p, "symbol", default=""))
+            if pos_magic == magic and pos_symbol == symbol:
+                candidates.append(p)
+        if ticket is not None:
+            exact = [p for p in candidates if int(_field(p, "ticket", default=-1)) == int(ticket)]
+            candidates = exact or candidates
+        if not candidates:
+            return {"success": False, "error": "Order response received but no matching open position was reconciled", "retcode": retcode}
+        pos = candidates[-1]
+        actual_ticket = int(_field(pos, "ticket", default=ticket or 0))
+        actual_price = float(_field(pos, "price_open", "open_price", default=fill_price) or fill_price)
+        actual_volume = float(_field(pos, "volume", "lots", default=size) or size)
+        if requested_price is not None and not _check_slippage(symbol, direction, requested_price, actual_price):
+            logger.warning(f"⚠️ Slippage beyond tolerance, but position already open. Monitoring manually.")
+        logger.info(f"✅ ORDER RECONCILED | {symbol} {direction} {actual_volume} @ {actual_price} | ticket:{actual_ticket}")
+        return {"success": True, "ticket": actual_ticket, "price": actual_price, "volume": actual_volume, "retcode": retcode}
+    except Exception as e:
+        logger.error(f"Order send exception: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+def entry_fallback(symbol: str, direction: str) -> float:
+    try:
+        if hasattr(mt5, "get_last_tick"):
+            tick = mt5.get_last_tick(symbol)
+            if tick:
+                return float(_field(tick, "ask" if direction == "BUY" else "bid", default=0) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+def _position_exists(ticket: int) -> bool:
+    return any(int(_field(p, "ticket", default=-1)) == int(ticket) for p in get_open_mt5_positions())
+
+def close_mt5_position(ticket, reason: str = "") -> bool:
+    try:
+        if not _position_exists(ticket):
+            return True
+        result = mt5.close_position(ticket)
+        if result is not None:
+            retcode = _field(result, "retcode", default=0)
+            if isinstance(retcode, int) and retcode not in (0, 10008, 10009, 10010):
+                logger.error(f"Close rejected [{ticket}] retcode={retcode}")
+                return False
+        for _ in range(3):
+            if not _position_exists(ticket):
+                logger.info(f"🔴 POSITION CLOSED & VERIFIED | Ticket:{ticket} | Reason:{reason}")
+                return True
+            time.sleep(0.15)
+        logger.error(f"Close not verified [{ticket}] — local state retained")
+        return False
+    except Exception as e:
+        logger.error(f"Close position failed [{ticket}]: {e}")
+        return False
+
+def modify_position_sl(ticket, new_sl: float) -> bool:
+    try:
+        if not _position_exists(ticket):
+            return False
+        result = mt5.modify_sl(ticket, new_sl)
+        if result is not None:
+            retcode = _field(result, "retcode", default=0)
+            if isinstance(retcode, int) and retcode not in (0, 10008, 10009, 10010):
+                logger.error(f"SL modify rejected [{ticket}] retcode={retcode}")
+                return False
+        pos = next((p for p in get_open_mt5_positions() if int(_field(p, "ticket", default=-1)) == int(ticket)), None)
+        broker_sl = float(_field(pos, "sl", default=0) or 0) if pos else 0
+        if pos is not None and abs(broker_sl - new_sl) > max(0.01, abs(new_sl) * 1e-6):
+            logger.error(f"SL modify not verified [{ticket}] requested={new_sl} broker={broker_sl}")
+            return False
+        logger.info(f"🔧 SL MODIFIED & VERIFIED | Ticket:{ticket} -> {new_sl:.2f}")
+        return True
+    except Exception as e:
+        logger.error(f"Modify SL failed [{ticket}]: {e}")
+        return False
+
+def execute_trade_plan(plan: TradePlan, symbol: str, magic: int = MAGIC_SINGLE) -> bool:
+    if not plan.valid or plan.position_size <= 0:
+        return False
+    result = send_market_order(symbol, plan.direction, plan.position_size, plan.sl, plan.tp, magic,
+                               requested_price=plan.entry)
+    if not result.get("success"):
+        return False
+    entry_price = float(result.get("price") or plan.entry)
+    ticket = int(result["ticket"])
+    actual_size = float(result.get("volume") or plan.position_size)
+    trade = {
+        "ticket": ticket, "symbol": symbol, "direction": plan.direction,
+        "entry": entry_price, "sl": plan.sl, "initial_sl": plan.sl,
+        "initial_risk": abs(entry_price - plan.sl), "tp": plan.tp,
+        "size": actual_size, "actual_risk": plan.actual_risk, "magic": magic,
+        "open_time": datetime.now().isoformat(), "breakeven": False,
+        "highest_r": 0.0, "news_protected": False, "news_frozen": False,
+    }
+    state.open_trades[str(ticket)] = trade
+    if state.active_trade is None:
+        state.active_trade = trade
+    if magic == MAGIC_SPLIT_2:
+        state.runner_trade = trade
+    save_trade_state()
+    return True
+
+def calculate_current_r(trade: Dict, current_price: float) -> float:
+    risk = trade.get("initial_risk", 0) or 1e-8
+    if trade["direction"] == "BUY":
+        return (current_price - trade["entry"]) / risk
+    return (trade["entry"] - current_price) / risk
+
+def apply_breakeven(trade: Dict, current_r: float) -> bool:
+    if trade.get("breakeven"):
+        return False
+    if current_r >= 1.0:
+        if modify_position_sl(trade["ticket"], trade["entry"]):
+            trade["sl"] = trade["entry"]
+            trade["breakeven"] = True
+            logger.info(f"⚖️ BREAKEVEN | Ticket:{trade['ticket']} SL -> Entry {trade['entry']:.2f}")
+            return True
+    return False
+
+def apply_trailing_stop(trade: Dict, ltf_df: pd.DataFrame, current_r: float) -> bool:
+    new_sl, changed = calculate_trailing_sl(trade["direction"], trade["sl"], trade["entry"], ltf_df, current_r)
+    if changed and modify_position_sl(trade["ticket"], new_sl):
+        trade["sl"] = new_sl
+        return True
+    return False
+
+def check_htf_structure_break_exit(trade: Dict, htf_df: pd.DataFrame) -> bool:
+    if htf_df.empty:
+        return False
+    htf_structure, _ = detect_bos_choch(htf_df)
+    if trade["direction"] == "BUY" and htf_structure == Structure.BEARISH_CHOCH:
+        return True
+    if trade["direction"] == "SELL" and htf_structure == Structure.BULLISH_CHOCH:
+        return True
+    return False
+
+def apply_pre_news_protection(trade: Dict, news_status: Dict, ltf_df: Optional[pd.DataFrame] = None) -> bool:
+    if not getattr(settings, 'NEWS_PROTECTION', True) or trade.get("news_protected"):
+        return False
+    if not news_status.get("pre_window", news_status.get("blocked", False)):
+        return False
+    current_r = trade.get("highest_r", 0.0)
+    if current_r >= 2.0:
+        return False
+    atr = _get_atr(ltf_df) if ltf_df is not None and not ltf_df.empty else 0.0
+    if atr <= 0:
+        buffer = 0.15 if state.current_symbol == "XAUUSD" else 1.5
+    else:
+        buffer = atr * 0.5
+    protected_sl = trade["entry"] - buffer if trade["direction"] == "BUY" else trade["entry"] + buffer
+    if modify_position_sl(trade["ticket"], protected_sl):
+        trade["sl"] = protected_sl
+        trade["news_protected"] = True
+        logger.info(f"📰 PRE-NEWS PROTECTION | SL shifted -> {protected_sl:.2f}")
+        return True
+    return False
+
+def _get_broker_balance(default: float) -> float:
+    try:
+        value = mt5.get_balance() if hasattr(mt5, "get_balance") else None
+        return float(value) if value is not None else default
+    except Exception:
+        return default
+
+def _get_broker_equity(default: float) -> float:
+    for name in ("get_equity", "equity"):
+        try:
+            fn = getattr(mt5, name, None)
+            if callable(fn):
+                value = fn()
+                if value is not None:
+                    return float(value)
+        except Exception:
+            pass
+    try:
+        info = mt5.terminal_info() if hasattr(mt5, "terminal_info") else None
+        value = _field(info, "equity", default=None)
+        if value is not None:
+            return float(value)
+    except Exception:
+        pass
+    return default
+
+def sync_account_state():
+    if not state.mt5_connected:
+        return
+    old_balance = state.balance
+    balance = _get_broker_balance(old_balance)
+    equity = _get_broker_equity(balance)
+    if balance > 0:
+        state.balance = balance
+    state.equity = equity if equity > 0 else state.balance
+    try:
+        fm = mt5.get_free_margin() if hasattr(mt5, "get_free_margin") else None
+        if fm is not None:
+            state.free_margin = float(fm)
+    except Exception:
+        pass
+    state.peak_equity = max(state.peak_equity, state.equity)
+    update_daily_peak()
+
+def record_closed_trade(trade: Dict, exit_price: float, reason: str, realized_pnl: Optional[float] = None):
+    risk = float(trade.get("initial_risk", 0) or 1e-8)
+    pnl_points = (exit_price - trade["entry"]) if trade["direction"] == "BUY" else (trade["entry"] - exit_price)
+    r_multiple = pnl_points / risk
+    if realized_pnl is None:
+        specs = get_symbol_specs(trade.get("symbol", state.current_symbol))
+        realized_pnl = pnl_points * float(trade.get("size", 0)) * float(specs["contract_size"])
+    record = {
+        "time": datetime.now().isoformat(), "symbol": trade.get("symbol", state.current_symbol),
+        "direction": trade["direction"], "entry": trade["entry"], "exit": exit_price,
+        "sl": trade.get("sl", 0), "tp": trade.get("tp", 0), "reason": reason,
+        "r_multiple": round(r_multiple, 2), "pnl_dollar": round(float(realized_pnl), 2),
+        "ticket": trade.get("ticket"), "magic": trade.get("magic"),
+    }
+    state.trade_history.append(record)
+    state.total_r += r_multiple
+    sync_account_state()
+    state.equity_curve.append(round(state.equity, 2))
+    state.equity_curve = state.equity_curve[-200:]
+    dd = calculate_daily_drawdown()
+    state.max_drawdown = max(state.max_drawdown, dd)
+    if r_multiple > 0.05:
+        state.daily_wins += 1; state.consecutive_losses = 0
+    elif r_multiple < -0.05:
+        state.daily_losses += 1; state.consecutive_losses += 1
+    else:
+        state.daily_be += 1; state.consecutive_losses = 0
+    logger.info(f"📒 TRADE CLOSED | {record['direction']} {record['symbol']} | R:{r_multiple:+.2f} | PnL:${float(realized_pnl):+.2f} | Reason:{reason}")
+    try:
+        asyncio.create_task(notify(format_exit_alert(trade, exit_price, r_multiple, float(realized_pnl), reason)))
+    except RuntimeError:
+        pass
+
+def _remove_trade(ticket: int):
+    state.open_trades.pop(str(ticket), None)
+    if state.runner_trade and int(state.runner_trade.get("ticket", -1)) == int(ticket):
+        state.runner_trade = None
+    state.active_trade = next(iter(state.open_trades.values()), None)
+    save_trade_state()
+
+def _close_and_record(trade: Dict, exit_price: float, reason: str) -> bool:
+    ticket = int(trade["ticket"])
+    if not close_mt5_position(ticket, reason):
+        return False
+    record_closed_trade(trade, exit_price, reason)
+    _remove_trade(ticket)
+    return True
+
+def _manage_one_trade(trade: Dict, ltf_df: pd.DataFrame, htf_df: pd.DataFrame):
+    if not trade or ltf_df.empty:
+        return
+    current_price = float(ltf_df['Close'].iloc[-1])
+    current_r = calculate_current_r(trade, current_price)
+    trade["highest_r"] = max(trade.get("highest_r", 0.0), current_r)
+    hit_sl = (trade["direction"] == "BUY" and current_price <= trade["sl"]) or (trade["direction"] == "SELL" and current_price >= trade["sl"])
+    if hit_sl:
+        _close_and_record(trade, trade["sl"], "STOP_OUT"); return
+    if trade.get("tp"):
+        hit_tp = (trade["direction"] == "BUY" and current_price >= trade["tp"]) or (trade["direction"] == "SELL" and current_price <= trade["tp"])
+        if hit_tp:
+            _close_and_record(trade, trade["tp"], "TARGET_HIT"); return
+    if check_htf_structure_break_exit(trade, htf_df):
+        _close_and_record(trade, current_price, "HTF_STRUCTURE_BREAK"); return
+    news_status = check_news_protection()
+    apply_pre_news_protection(trade, news_status, ltf_df)
+    apply_breakeven(trade, current_r)
+    apply_trailing_stop(trade, ltf_df, current_r)
+
+def manage_active_trade(ltf_df: pd.DataFrame, htf_df: pd.DataFrame):
+    if not state.open_trades and state.active_trade:
+        state.open_trades[str(state.active_trade["ticket"])] = state.active_trade
+    broker_trades = sync_open_positions_from_broker()
+    broker_tickets = {str(t["ticket"]) for t in broker_trades}
+    for trade in list(state.open_trades.values()):
+        if str(trade["ticket"]) in broker_tickets:
+            _manage_one_trade(trade, ltf_df, htf_df)
+    for ticket, trade in list(state.open_trades.items()):
+        if ticket not in broker_tickets:
+            logger.warning(f"♻️ BROKER CLOSED POSITION DETECTED | ticket:{ticket}; attempting history deal fetch")
+            closed_records = fetch_mt5_history_deals(symbol=trade.get('symbol'), since=datetime.now() - timedelta(days=1))
+            found = None
+            for deal in closed_records:
+                if int(_field(deal, 'ticket', default=-1)) == int(ticket):
+                    found = deal
+                    break
+            if found:
+                exit_price = float(_field(found, 'price', 'price_close', default=trade.get('entry', 0)) or trade.get('entry', 0))
+                pnl = float(_field(found, 'profit', 'pnl', default=None) or 0.0)
+                record_closed_trade(trade, exit_price, "BROKER_CLOSED", realized_pnl=pnl)
+            else:
+                logger.warning(f"No history deal found for ticket {ticket}; removing local state without PnL record")
+                state.open_trades.pop(ticket, None)
+            _remove_trade(int(ticket))
+    state.active_trade = next(iter(state.open_trades.values()), None)
+    save_trade_state()
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 12: SAFETY & PROTECTION SYSTEMS
+# ═══════════════════════════════════════════════════════════════════════
+def check_drawdown_protection() -> bool:
+    daily_dd = calculate_daily_drawdown()
+    limit_pct = float(getattr(settings, "DAILY_MAX_DRAWDOWN_PCT", 0.05)) * 100.0
+    if daily_dd >= limit_pct:
+        if not state.daily_trading_halted:
+            state.daily_trading_halted = True
+            state.daily_halt_reason = f"Daily equity DD limit hit ({daily_dd:.2f}%)"
+            logger.critical(f"🔒 DAILY EQUITY DD LIMIT | {daily_dd:.2f}% — trading halted for day")
+            try:
+                asyncio.create_task(notify(f"🔒 *DAILY EQUITY DD LIMIT* | {daily_dd:.2f}% — trading halted"))
+            except RuntimeError:
+                pass
+        return False
+    max_loss_amount = float(getattr(settings, "DAILY_MAX_LOSS_AMOUNT", 0.0) or 0.0)
+    if max_loss_amount > 0:
+        daily_loss_dollar = state.daily_starting_balance - state.equity
+        if daily_loss_dollar >= max_loss_amount:
+            if not state.daily_trading_halted:
+                state.daily_trading_halted = True
+                state.daily_halt_reason = f"Daily max loss amount hit (${daily_loss_dollar:.2f})"
+                logger.critical(f"🔒 DAILY MAX LOSS AMOUNT | ${daily_loss_dollar:.2f} — trading halted")
+                try:
+                    asyncio.create_task(notify(f"🔒 *DAILY MAX LOSS AMOUNT* | ${daily_loss_dollar:.2f} — trading halted"))
+                except RuntimeError:
+                    pass
+            return False
+    return True
+
+def check_session_drawdown_protection(session_name: str) -> bool:
+    if not getattr(settings, 'ENABLE_SESSION_LIMITS', True):
+        return True
+    session_limit_pct = float(getattr(settings, "SESSION_MAX_DRAWDOWN_PCT", 0.03)) * 100.0
+    current_dd = 0.0
+    if session_name in state.session_peak:
+        peak = state.session_peak[session_name]
+        current_balance = state.balance
+        if peak > 0:
+            current_dd = ((peak - current_balance) / peak) * 100.0
+    if current_dd >= session_limit_pct:
+        logger.critical(f"🔒 SESSION DD LIMIT | {session_name}: {current_dd:.2f}% — entries blocked")
+        return False
+    return True
+
+def check_consecutive_loss_protection() -> bool:
+    limit = getattr(settings, 'CONSECUTIVE_LOSS_LIMIT', 3)
+    if state.consecutive_losses >= limit + 2:
+        state.daily_trading_halted = True
+        state.daily_halt_reason = f"{state.consecutive_losses} consecutive losses — stopped for day"
+        logger.critical(f"🔒 CONSECUTIVE LOSS STOP | {state.consecutive_losses} losses")
+        return False
+    if state.consecutive_losses >= limit:
+        if state.consecutive_loss_cooldown_until is None:
+            state.consecutive_loss_cooldown_until = (datetime.now() + timedelta(hours=1)).isoformat()
+            logger.warning(f"⏸️ COOLDOWN | {state.consecutive_losses} consecutive losses — 1h cooldown")
+        cooldown_end = datetime.fromisoformat(state.consecutive_loss_cooldown_until)
+        if datetime.now() < cooldown_end:
+            return False
+        else:
+            state.consecutive_loss_cooldown_until = None
+            state.consecutive_losses = 0
+    return True
+
+def check_volatility_filter(ltf_df: pd.DataFrame) -> bool:
+    if not getattr(settings, 'VOLATILITY_FILTER', True) or ltf_df.empty:
+        return True
+    threshold = float(getattr(settings, 'VOLATILITY_FILTER_PERCENTILE', 0.10))
+    atr_pctile = float(ltf_df['atr_pctile'].iloc[-1]) if 'atr_pctile' in ltf_df.columns else 0.5
+    if atr_pctile < threshold:
+        logger.info(f"⛔ VOLATILITY FILTER | Dead market (ATR pctile {atr_pctile:.2f})")
+        return False
+    return True
+
+def check_risk_of_ruin_protection() -> bool:
+    min_balance = float(getattr(settings, 'MIN_VIABLE_BALANCE', 0.0) or 0.0)
+    if min_balance > 0 and state.balance < min_balance:
+        if not state.daily_trading_halted:
+            state.daily_trading_halted = True
+            state.daily_halt_reason = f"Balance below minimum viable ({state.balance:.2f} < {min_balance:.2f})"
+            logger.critical(f"🔒 RISK OF RUIN | Balance ${state.balance:.2f} below min ${min_balance:.2f}")
+            try:
+                asyncio.create_task(notify(f"🔒 *RISK OF RUIN* | Balance too low"))
+            except RuntimeError:
+                pass
+        return False
+    return True
+
+def run_safety_checks(ltf_df: pd.DataFrame) -> Tuple[bool, str]:
+    if state.daily_trading_halted:
+        return False, state.daily_halt_reason
+    if not check_risk_of_ruin_protection():
+        return False, state.daily_halt_reason
+    if not check_drawdown_protection():
+        return False, state.daily_halt_reason
+    current_session = state.session or detect_session().value
+    if not check_session_drawdown_protection(current_session):
+        return False, f"Session drawdown limit reached for {current_session}"
+    if not check_consecutive_loss_protection():
+        return False, "Consecutive loss cooldown active"
+    if not check_volatility_filter(ltf_df):
+        return False, "Volatility filter — dead market"
+    return True, "OK"
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 13: RETREAT & RE-ENTRY (ADVANCED)
+# ═══════════════════════════════════════════════════════════════════════
+def _is_valid_pullback(direction: str, current_price: float, ltf_df: pd.DataFrame) -> bool:
+    if ltf_df.empty:
+        return False
+    atr = _get_atr(ltf_df)
+    if atr <= 0:
+        return False
+    ltf_structure, _ = detect_bos_choch(ltf_df)
+    if direction == "BUY":
+        if ltf_structure not in (Structure.BULLISH, Structure.BULLISH_BOS, Structure.BULLISH_CHOCH):
+            return False
+        recent_high = float(ltf_df['High'].tail(5).max())
+        pullback = recent_high - current_price
+        return 0.3 * atr <= pullback <= 1.5 * atr
+    else:
+        if ltf_structure not in (Structure.BEARISH, Structure.BEARISH_BOS, Structure.BEARISH_CHOCH):
+            return False
+        recent_low = float(ltf_df['Low'].tail(5).min())
+        pullback = current_price - recent_low
+        return 0.3 * atr <= pullback <= 1.5 * atr
+
+def check_retreat_reentry(score: ScoreResult, ltf_df: pd.DataFrame, htf_df: pd.DataFrame) -> Optional[TradePlan]:
+    if state.mode != "SPLIT_ENTRY" or not state.runner_trade:
+        return None
+    runner = state.runner_trade
+    runner_direction = runner.get("direction")
+    if score.long_score < 75 and score.short_score < 75:
+        return None
+    direction = "BUY" if score.long_score >= 75 else "SELL"
+    if direction != runner_direction:
+        return None
+    adx = calculate_adx(ltf_df)
+    if adx < getattr(settings, 'ADX_TREND_THRESHOLD', 25.0):
+        logger.info(f"🔁 SCALE-IN SKIP | ADX {adx:.1f} below trend threshold")
+        return None
+    current_price = float(ltf_df['Close'].iloc[-1])
+    if not _is_valid_pullback(direction, current_price, ltf_df):
+        logger.info(f"🔁 SCALE-IN SKIP | No valid ATR pullback for {direction}")
+        return None
+    max_scale_ins = int(getattr(settings, 'MAX_SCALE_INS', 2))
+    existing_scale_ins = [t for t in state.open_trades.values() if t.get("magic") == MAGIC_SCALE_IN and t.get("direction") == direction]
+    if len(existing_scale_ins) >= max_scale_ins:
+        logger.info(f"🔁 SCALE-IN SKIP | Max scale-ins reached ({max_scale_ins})")
+        return None
+    sl, tp = calculate_sl_tp(direction, current_price, ltf_df, htf_df)
+    if sl <= 0:
+        return None
+    risk = abs(current_price - sl)
+    if risk < 1e-8:
+        return None
+    risk_pct = float(getattr(settings, 'RISK_PER_TRADE_PCT', 0.01)) * 0.5
+    position_size = calculate_position_size(state.current_symbol, current_price, sl, state.balance, risk_pct)
+    if position_size <= 0:
+        return None
+    specs = get_symbol_specs(state.current_symbol)
+    actual_risk = position_size * risk * float(specs["contract_size"])
+    max_risk = state.balance * risk_pct
+    if actual_risk > max_risk * 1.001:
+        logger.warning(f"🔁 SCALE-IN RISK EXCEEDED | actual ${actual_risk:.2f} > max ${max_risk:.2f}")
+        return None
+    rr = 2.0 if tp <= 0 else abs(tp - current_price) / risk
+    if rr < settings.MIN_RR_RATIO:
+        return None
+    plan = TradePlan(valid=True, direction=direction, entry=current_price, sl=sl, tp=tp,
+                     position_size=position_size, rr_ratio=round(rr, 2), actual_risk=round(actual_risk, 2))
+    return plan
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 14: DASHBOARD & API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SMC Quant Engine v4.1</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  body { background:#0a0a0a; color:#e5e7eb; font-family:'Inter',sans-serif; overflow-x:hidden; }
+  .card { background:#151515; border:1px solid #2a2a2a; border-radius:12px; padding:12px; }
+  .badge { font-size:10px; font-weight:bold; padding:2px 8px; border-radius:4px; }
+  .green { color:#26a69a; }
+  .red { color:#ef5350; }
+  .toggle-knob { transition: transform 0.2s; }
+  .tf-btn { padding:4px 10px; border-radius:6px; background:#1f1f1f; border:1px solid #333; color:#aaa; cursor:pointer; font-size:11px; }
+  .tf-btn.active { background:#26a69a; color:#fff; border-color:#26a69a; }
+</style>
+</head>
+<body class="p-3 space-y-3">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between">
+    <h1 class="text-lg font-bold">SMC Quant Engine <span class="green">v4.1</span></h1>
+    <div class="flex gap-2 items-center">
+      <span id="mt5badge" class="badge bg-red-500/20 text-red-500">MT5 OFF</span>
+      <span id="botbadge" class="badge bg-gray-500/20 text-gray-400">AUTO OFF</span>
+    </div>
+  </div>
+
+  <!-- Auto Trading Toggle -->
+  <div class="card flex items-center justify-between">
+    <span class="font-semibold">Auto Trading</span>
+    <button id="toggleAuto" class="w-12 h-7 bg-gray-600 rounded-full relative">
+      <div id="toggleKnob" class="w-6 h-6 bg-white rounded-full absolute top-0.5 left-0.5 toggle-knob"></div>
+    </button>
+  </div>
+
+  <!-- Stats -->
+  <div class="grid grid-cols-3 gap-2">
+    <div class="card"><div class="text-xs text-gray-500">Balance</div><div id="balance" class="text-xl font-bold">$0</div></div>
+    <div class="card"><div class="text-xs text-gray-500">Equity</div><div id="equity" class="text-xl font-bold">$0</div></div>
+    <div class="card"><div class="text-xs text-gray-500">Daily DD</div><div id="dd" class="text-xl font-bold red">0%</div></div>
+  </div>
+
+  <!-- Active Trade -->
+  <div id="tradeCard" class="card hidden">
+    <div class="flex justify-between">
+      <span id="tradeDir" class="font-bold text-sm"></span>
+      <span id="tradePnL" class="font-bold"></span>
+    </div>
+    <div class="text-xs mt-2 space-y-1">
+      <div>Entry: <span id="tradeEntry" class="font-mono"></span></div>
+      <div>SL: <span id="tradeSL" class="font-mono red"></span></div>
+      <div>TP: <span id="tradeTP" class="font-mono green"></span></div>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div class="card">
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-xs font-semibold">SMC Chart</span>
+      <div id="timeframes" class="flex gap-1">
+        <button class="tf-btn" data-tf="5M">5M</button>
+        <button class="tf-btn" data-tf="15M">15M</button>
+        <button class="tf-btn" data-tf="1H">1H</button>
+        <button class="tf-btn" data-tf="4H">4H</button>
+      </div>
+    </div>
+    <div id="chartContainer" style="width:100%;height:400px;"></div>
+  </div>
+
+  <!-- Equity Curve -->
+  <div class="card">
+    <div class="text-xs font-semibold mb-2">Equity Curve</div>
+    <canvas id="equityCanvas" class="h-24"></canvas>
+  </div>
+
+<script>
+let ws, currentTf = '5M';
+let chart, candleSeries, entryPriceLine=null, slPriceLine=null, tpPriceLine=null;
+
+function initChart() {
+  const container = document.getElementById('chartContainer');
+  chart = LightweightCharts.createChart(container, {
+    layout: { background: { color: '#0a0a0a' }, textColor: '#d1d5db' },
+    grid: { vertLines: { color: '#1f1f1f' }, horzLines: { color: '#1f1f1f' } },
+    timeScale: { borderColor: '#333' },
+    rightPriceScale: { borderColor: '#333' },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#26a69a', downColor: '#ef5350',
+    wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+    borderVisible: false,
+  });
+  chart.timeScale().fitContent();
+}
+
+function connectWS() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => updateStatus(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connectWS, 3000);
+}
+
+function updateStatus(d) {
+  document.getElementById('balance').textContent = '$' + d.balance.toFixed(2);
+  document.getElementById('equity').textContent = '$' + d.equity.toFixed(2);
+  document.getElementById('dd').textContent = d.current_daily_dd.toFixed(1) + '%';
+
+  const mt5 = document.getElementById('mt5badge');
+  if (d.mt5_connected) { mt5.textContent='MT5 ON'; mt5.className='badge bg-green-500/20 text-green-500'; }
+  else { mt5.textContent='MT5 OFF'; mt5.className='badge bg-red-500/20 text-red-500'; }
+
+  const auto = document.getElementById('botbadge');
+  const toggle = document.getElementById('toggleAuto');
+  const knob = document.getElementById('toggleKnob');
+  if (d.auto_trading) {
+    auto.textContent='AUTO ON'; auto.className='badge bg-green-500/20 text-green-500';
+    toggle.className='w-12 h-7 bg-green-600 rounded-full relative';
+    knob.style.transform='translateX(20px)';
+  } else {
+    auto.textContent='AUTO OFF'; auto.className='badge bg-gray-500/20 text-gray-400';
+    toggle.className='w-12 h-7 bg-gray-600 rounded-full relative';
+    knob.style.transform='translateX(0)';
+  }
+
+  if (d.active_trade) {
+    document.getElementById('tradeCard').classList.remove('hidden');
+    const dir = document.getElementById('tradeDir');
+    dir.textContent = d.active_trade.direction + ' ' + d.symbol;
+    dir.className = d.active_trade.direction === 'BUY' ? 'font-bold text-sm green' : 'font-bold text-sm red';
+    document.getElementById('tradeEntry').textContent = d.active_trade.entry.toFixed(2);
+    document.getElementById('tradeSL').textContent = d.active_trade.sl.toFixed(2);
+    document.getElementById('tradeTP').textContent = (d.active_trade.tp || 0).toFixed(2);
+    const pnl = document.getElementById('tradePnL');
+    pnl.textContent = (d.active_trade_pnl >= 0 ? '+$' : '-$') + Math.abs(d.active_trade_pnl).toFixed(2);
+    pnl.className = d.active_trade_pnl >= 0 ? 'font-bold green' : 'font-bold red';
+  } else {
+    document.getElementById('tradeCard').classList.add('hidden');
+  }
+  drawEquityCurve(d.equity_curve || []);
+}
+
+document.getElementById('toggleAuto').onclick = async () => {
+  try {
+    const res = await fetch('/api/toggle-auto', {method:'POST'});
+    const data = await res.json();
+    if (data.error) alert(data.error);
+    else updateStatus(data);
+  } catch(e) { console.error(e); }
+};
+
+// Timeframe buttons
+document.querySelectorAll('.tf-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentTf = btn.dataset.tf;
+    loadChart();
+  });
+});
+document.querySelector('.tf-btn[data-tf="5M"]').classList.add('active');
+
+async function loadChart() {
+  try {
+    const res = await fetch(`/api/chart?tf=${currentTf}`);
+    const data = await res.json();
+    renderChart(data);
+  } catch(e) { console.error(e); }
+}
+
+function renderChart(data) {
+  if (!data.candles || data.candles.length < 2) return;
+  const candles = data.candles.map(c => ({
+    time: c.time_unix,
+    open: c.open,
+    high: c.high,
+    low: c.low,
+    close: c.close,
+  }));
+  candleSeries.setData(candles);
+
+  // ── 1. Swing markers ─────────────────────────────────────────────
+  const markers = (data.swings || []).map(s => ({
+    time: candles[s.index] ? candles[s.index].time : candles[candles.length-1].time,
+    position: s.type === 'high' ? 'aboveBar' : 'belowBar',
+    color: s.type === 'high' ? '#ef5350' : '#26a69a',
+    shape: s.type === 'high' ? 'arrowDown' : 'arrowUp',
+    text: s.type === 'high' ? 'H' : 'L',
+    size: 2,
+  }));
+
+  // ── 2. Phase 11A liquidity event markers ─────────────────────────
+  (data.phase11a_liquidity_events || []).forEach(ev => {
+    const idx = ev.bar_index;
+    const time = candles[idx] ? candles[idx].time : candles[candles.length-1].time;
+    markers.push({
+      time: time,
+      position: ev.swing_type === 'LOW' ? 'belowBar' : 'aboveBar',
+      color: ev.valid_sweep ? '#f59e0b' : '#6b7280',
+      shape: ev.valid_sweep ? 'circle' : 'square',
+      text: ev.interaction,
+      size: 2,
+    });
+  });
+
+  candleSeries.setMarkers(markers);
+
+  // ── 3. Structure levels (using price lines) ─────────────────────
+  clearTradeLines();
+  if (data.levels) {
+    const ls = data.levels;
+    if (ls.last_swing_high) addPriceLine(ls.last_swing_high, 'rgba(239,83,80,0.6)', 'SH');
+    if (ls.last_swing_low) addPriceLine(ls.last_swing_low, 'rgba(38,166,154,0.6)', 'SL');
+  }
+
+  // ── 4. Phase 11A swing zone lines (optional) ────────────────────
+  (data.phase11a_candidates || []).forEach(c => {
+    addPriceLine(c.zone_high, 'rgba(239,83,80,0.25)', 'ZH' + c.index);
+    addPriceLine(c.zone_low, 'rgba(38,166,154,0.25)', 'ZL' + c.index);
+  });
+
+  // ── 5. Active trade lines ────────────────────────────────────────
+  if (data.trade) {
+    const t = data.trade;
+    addPriceLine(t.entry, '#ffffff', 'Entry');
+    addPriceLine(t.sl, '#ef5350', 'SL');
+    if (t.tp > 0) addPriceLine(t.tp, '#26a69a', 'TP');
+  }
+
+  chart.timeScale().fitContent();
+}
+
+let tradeLines = [];  // සියලුම price lines track කිරීමට array එකක්
+
+function clearTradeLines() {
+  tradeLines.forEach(line => candleSeries.removePriceLine(line));
+  tradeLines = [];
+}
+
+function addPriceLine(price, color, title) {
+  const line = candleSeries.createPriceLine({
+    price: price,
+    color: color,
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title: title,
+  });
+  tradeLines.push(line);
+  return line;
+}
+
+function drawEquityCurve(data) {
+  const canvas = document.getElementById('equityCanvas');
+  const ctx = canvas.getContext('2d');
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width; canvas.height = rect.height;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  if (!data || data.length < 2) return;
+  const min = Math.min(...data), max = Math.max(...data), range = max-min || 1;
+  ctx.beginPath();
+  ctx.strokeStyle = '#26a69a';
+  ctx.lineWidth = 2;
+  data.forEach((v,i)=>{
+    const x = (i/(data.length-1))*w;
+    const y = h - ((v-min)/range)*(h-10)-5;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+}
+
+initChart();
+connectWS();
+loadChart();
+setInterval(loadChart, 10000);
+</script>
+</body>
+</html>
+"""
+def _admin_authorized(request: Request) -> bool:
+    key = str(getattr(settings, "ADMIN_API_KEY", "") or "")
+    if not key:
+        return not bool(getattr(settings, "REQUIRE_ADMIN_AUTH", False))
+    supplied = request.headers.get("X-API-Key", "")
+    return supplied == key
+
+def _webhook_authorized(request: Request) -> bool:
+    key = str(getattr(settings, "ADMIN_API_KEY", "") or "")
+    if not bool(getattr(settings, "REQUIRE_WEBHOOK_AUTH", True)):
+        return True
+    return bool(key) and request.headers.get("X-API-Key", "") == key
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.now().isoformat(), "mt5_connected": state.mt5_connected}
+
+@app.get("/api/status")
+async def api_status():
+    total_closed = state.daily_wins + state.daily_losses + state.daily_be
+    win_rate = (state.daily_wins / max(total_closed, 1)) * 100
+    avg_r = state.total_r / max(len(state.trade_history), 1)
+    unrealized_pnl = 0.0
+    if state.active_trade:
+        try:
+            p = mt5.get_position_profit(state.active_trade["ticket"])
+            unrealized_pnl = p if p is not None else 0.0
+        except: pass
+    current_dd = calculate_daily_drawdown()
+    state.mt5_connected = check_mt5_connection()
+    if state.auto_trading and not state.mt5_connected:
+        state.auto_trading = False
+        logger.critical("🔒 SAFETY KILL | Auto trading disabled — MT5 connection lost")
+    news_status = {"blocked": False}
+    if settings.NEWS_PROTECTION:
+        try:
+            news_status = news_mgr.check_news_window(settings.PRE_NEWS_MINUTES, settings.NEWS_FREEZE_MINUTES, state.current_symbol)
+        except: pass
+    spread_check = check_spread_filter(state.current_symbol)
+    return {
+        "auto_trading": state.auto_trading,
+        "balance": round(state.balance, 2),
+        "equity": round(state.equity, 2),
+        "free_margin": round(state.free_margin, 2),
+        "mode": state.mode,
+        "symbol": state.current_symbol,
+        "session": state.session,
+        "daily_trades": state.daily_trades,
+        "daily_wins": state.daily_wins,
+        "daily_losses": state.daily_losses,
+        "win_rate": round(win_rate, 1),
+        "avg_r": round(avg_r, 2),
+        "total_r": round(state.total_r, 2),
+        "max_drawdown": round(state.max_drawdown, 2),
+        "current_daily_dd": round(current_dd, 2),
+        "daily_peak": round(state.daily_peak, 2),
+        "daily_start": round(state.daily_starting_balance, 2),
+        "last_reset_date": state.last_reset_date,
+        "session_trades": state.session_trades,
+        "max_daily_trades": settings.MAX_DAILY_TRADES,
+        "news_blocked": news_status.get("blocked", False),
+        "news_reason": news_status.get("reason"),
+        "news_event": news_status.get("event", {}).get("title") if news_status.get("event") else None,
+        "news_today": get_today_news(),
+        "current_spread": round(state.current_spread, 2),
+        "spread_limit": spread_check["limit"],
+        "spread_limit_gold": getattr(settings, 'SPREAD_LIMIT_GOLD', 5.0),
+        "spread_limit_btc": getattr(settings, 'SPREAD_LIMIT_BTC', 50.0),
+        "spread_blocked": not spread_check["allowed"],
+        "mt5_connected": state.mt5_connected,
+        "mt5_status_text": "CONNECTED" if state.mt5_connected else "DISCONNECTED",
+        "last_decision": state.last_score.get("decision", "NO SETUP") if state.last_score else "NO SETUP",
+        "last_prob_long": state.last_score.get("long_prob", 0) if state.last_score else 0,
+        "last_prob_short": state.last_score.get("short_prob", 0) if state.last_score else 0,
+        "active_trade": state.active_trade,
+        "open_trades": list(state.open_trades.values()),
+        "open_trade_count": len(state.open_trades),
+        "active_trade_pnl": round(unrealized_pnl, 2),
+        "equity_curve": list(state.equity_curve)[-50:],
+        "trade_recovered": state.trade_recovered,
+        "daily_trading_halted": state.daily_trading_halted,
+        "daily_halt_reason": state.daily_halt_reason,
+        "consecutive_losses": state.consecutive_losses,
+        "ml_model_ready": state.ml_model_ready,
+        "last_ml_train_time": state.last_ml_train_time,
+    }
+
+@app.get("/api/chart")
+async def api_chart(tf: str = "5M"):
+    """
+    TradingView-style chart data.
+    Returns candle data, swing points, levels, active trade, and Phase 11A scan.
+    """
+    symbol = get_symbol_for_datetime(datetime.now())
+    bars = 300 if tf == "5M" else 200
+
+    df = fetch_and_build(symbol, tf, bars)
+    if df.empty:
+        return {
+            "candles": [],
+            "swings": [],
+            "structure": "NEUTRAL",
+            "levels": {},
+            "trade": None,
+            "current_price": 0.0,
+            "symbol": symbol,
+            "phase11a_candidates": [],
+            "phase11a_liquidity_events": [],
+        }
+
+    marked = detect_swings(df)
+
+    candles = []
+    swings = []
+    for i in range(len(marked)):
+        idx = marked.index[i]
+        if hasattr(idx, 'timestamp'):
+            time_unix = int(idx.timestamp())
+        else:
+            time_unix = i
+
+        candles.append({
+            "time_unix": time_unix,
+            "open": float(marked['Open'].iloc[i]),
+            "high": float(marked['High'].iloc[i]),
+            "low": float(marked['Low'].iloc[i]),
+            "close": float(marked['Close'].iloc[i]),
+        })
+
+        if bool(marked['swing_high'].iloc[i]):
+            swings.append({"index": i, "type": "high", "price": float(marked['High'].iloc[i])})
+        if bool(marked['swing_low'].iloc[i]):
+            swings.append({"index": i, "type": "low", "price": float(marked['Low'].iloc[i])})
+
+    # Structure + Levels
+    structure, levels = detect_bos_choch(df)
+
+    # ── Phase 11A Scan ───────────────────────────────────────────────
+    scan = phase11a_scan(df)
+
+    # Convert SwingCandidate dataclasses to JSON-friendly dicts (last 10 only)
+    candidates_light = []
+    for c in scan["candidates"][-10:]:
+        candidates_light.append({
+            "id": c.id,
+            "type": c.type.value,
+            "price": c.price,
+            "index": c.index,
+            "zone_high": c.zone_high,
+            "zone_low": c.zone_low,
+            "strength": c.strength,
+            "liquidity_level": c.liquidity_level,
+            "status": c.status.value,
+            "expires_bar": c.expires_bar,
+        })
+
+    # Convert LiquidityEvent dataclasses to JSON-friendly dicts (last 10 only)
+    events_light = []
+    for e in scan["liquidity_events"][-10:]:
+        events_light.append({
+            "swing_id": e.swing_id,
+            "swing_type": e.swing_type.value,
+            "level": e.level,
+            "bar_index": e.bar_index,
+            "interaction": e.interaction.value,
+            "valid_sweep": e.valid_sweep,
+            "quality": e.quality,
+            "reason": e.reason,
+        })
+    # ─────────────────────────────────────────────────────────────────
+
+    return {
+        "candles": candles,
+        "swings": swings,
+        "structure": structure.value,
+        "levels": levels,
+        "trade": state.active_trade,
+        "current_price": float(marked['Close'].iloc[-1]),
+        "symbol": symbol,
+        "phase11a_candidates": candidates_light,
+        "phase11a_liquidity_events": events_light,
+    }
+
+@app.get("/api/history")
+async def api_history():
+    return list(state.trade_history)
+
+@app.get("/api/settings")
+async def api_settings():
+    return {
+        "primary_symbol": settings.PRIMARY_SYMBOL,
+        "risk_per_trade_pct": settings.RISK_PER_TRADE_PCT,
+        "min_rr_ratio": settings.MIN_RR_RATIO,
+        "max_daily_trades": settings.MAX_DAILY_TRADES,
+        "max_trades_per_session": settings.MAX_TRADES_PER_SESSION,
+        "enable_asian": settings.ENABLE_ASIAN_SESSION,
+        "enable_london": settings.ENABLE_LONDON_SESSION,
+        "enable_ny": settings.ENABLE_NEWYORK_SESSION,
+        "enable_session_limits": settings.ENABLE_SESSION_LIMITS,
+        "asian_auto_elevate": settings.ASIAN_AUTO_ELEVATE,
+        "news_protection": settings.NEWS_PROTECTION,
+        "pre_news_minutes": settings.PRE_NEWS_MINUTES,
+        "news_freeze_minutes": settings.NEWS_FREEZE_MINUTES,
+        "daily_max_drawdown": settings.DAILY_MAX_DRAWDOWN_PCT,
+        "session_max_drawdown": settings.SESSION_MAX_DRAWDOWN_PCT,
+        "spread_limit_gold": getattr(settings, 'SPREAD_LIMIT_GOLD', 5.0),
+        "spread_limit_btc": getattr(settings, 'SPREAD_LIMIT_BTC', 50.0),
+        "enable_ml_engine": getattr(settings, 'ENABLE_ML_ENGINE', True),
+        "enable_telegram_alerts": getattr(settings, 'ENABLE_TELEGRAM_ALERTS', False),
+        "enable_discord_alerts": getattr(settings, 'ENABLE_DISCORD_ALERTS', False),
+        "volatility_filter": getattr(settings, 'VOLATILITY_FILTER', True),
+        "market_regime_detect": getattr(settings, 'MARKET_REGIME_DETECT', True),
+        "dxy_correlation": getattr(settings, 'DXY_CORRELATION', False),
+    }
+
+@app.post("/api/settings")
+async def update_settings(payload: Dict[str, Any], request: Request):
+    if not _admin_authorized(request):
+        return {"error": "Unauthorized"}
+    for key, value in payload.items():
+        if hasattr(settings, key.upper()):
+            if key.upper() in ("RISK_PER_TRADE_PCT", "MAX_RISK_PER_TRADE_PCT",
+                               "DAILY_MAX_DRAWDOWN_PCT", "SESSION_MAX_DRAWDOWN_PCT") and float(value) < 0:
+                continue
+            setattr(settings, key.upper(), value)
+    return {"status": "updated"}
+
+@app.post("/api/toggle-auto")
+async def toggle_auto(request: Request):
+    if not _admin_authorized(request):
+        return {"auto_trading": state.auto_trading, "error": "Unauthorized", "mt5_connected": state.mt5_connected}
+    state.mt5_connected = check_mt5_connection()
+    if state.auto_trading:
+        state.auto_trading = False
+        logger.info("🛑 Auto Trading turned OFF by user")
+        return {"auto_trading": False, "mt5_connected": state.mt5_connected}
+    else:
+        if not state.mt5_connected:
+            logger.warning("⛔ TOGGLE REJECTED | MT5 not connected")
+            return {"auto_trading": False, "error": "MT5 not connected. Connect to MT5 first.", "mt5_connected": False}
+        state.auto_trading = True
+        logger.info("🟢 Auto Trading turned ON by user")
+        return {"auto_trading": True, "mt5_connected": state.mt5_connected}
+
+@app.post("/api/reset-daily-halt")
+async def reset_daily_halt(request: Request):
+    if not _admin_authorized(request):
+        return {"error": "Unauthorized"}
+    state.daily_trading_halted = False
+    state.daily_halt_reason = ""
+    state.consecutive_loss_cooldown_until = None
+    logger.warning("🔓 DAILY HALT MANUALLY RESET by user")
+    return {"status": "reset", "daily_trading_halted": state.daily_trading_halted}
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    if not _webhook_authorized(request):
+        return {"status": "rejected", "error": "Unauthorized"}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if "balance" in payload:
+        try:
+            state.balance = float(payload["balance"])
+            update_daily_peak()
+            update_trading_mode()
+            logger.info(f"💰 BALANCE UPDATED via webhook: ${state.balance:.2f}")
+        except (TypeError, ValueError):
+            pass
+    if payload.get("action") == "close_all" and state.active_trade:
+        close_mt5_position(state.active_trade["ticket"], "WEBHOOK_CLOSE")
+        state.active_trade = None
+        save_trade_state()
+    return {"status": "received", "balance": round(state.balance, 2)}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            status = await api_status()
+            await websocket.send_json(status)
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+
+# Helper functions
+def get_symbol_for_datetime(dt: datetime) -> str:
+    weekday = dt.weekday()
+    if weekday <= 4: return "XAUUSD"
+    else: return "BTCUSD"
+
+def check_daily_reset():
+    now = _market_time()
+    today_str = now.strftime("%Y-%m-%d")
+    if state.last_reset_date == today_str: return False
+    logger.info("=" * 60)
+    logger.info(f"🌅 DAILY RESET | Date: {today_str}")
+    logger.info(f"   Previous: Trades:{state.daily_trades} W:{state.daily_wins} L:{state.daily_losses} BE:{state.daily_be}")
+    logger.info(f"   Peak: ${state.daily_peak:.2f} | End: ${state.balance:.2f} | Max DD: {state.max_drawdown:.2f}%")
+    logger.info("=" * 60)
+    state.last_reset_date = today_str
+    state.daily_trades = state.daily_wins = state.daily_losses = state.daily_be = 0
+    state.consecutive_losses = 0
+    state.max_drawdown = 0.0
+    state.daily_starting_balance = state.balance
+    state.daily_peak = state.equity
+    state.peak_equity = state.equity
+    state.session_trades = {}
+    state.session_start_balance = {}
+    state.session_peak = {}
+    state.session_max_dd = {}
+    state.trade_recovered = False
+    state.daily_trading_halted = False
+    state.daily_halt_reason = ""
+    state.consecutive_loss_cooldown_until = None
+    logger.info(f"✅ Reset Complete | Start: ${state.daily_starting_balance:.2f}")
+    logger.info("=" * 60)
+    try:
+        asyncio.create_task(notify(format_daily_summary()))
+    except RuntimeError:
+        pass
+    return True
+
+def update_daily_peak():
+    state.daily_peak = max(state.daily_peak, state.equity, state.balance)
+    state.peak_equity = max(state.peak_equity, state.equity)
+
+def calculate_daily_drawdown() -> float:
+    peak = max(float(state.daily_peak), float(state.peak_equity), 1e-9)
+    return max(0.0, (peak - float(state.equity)) / peak * 100.0)
+
+def check_session_enabled(session_name: str) -> bool:
+    session_map = {
+        "ASIAN": settings.ENABLE_ASIAN_SESSION,
+        "LONDON": settings.ENABLE_LONDON_SESSION,
+        "LONDON_NY": settings.ENABLE_LONDON_SESSION and settings.ENABLE_NEWYORK_SESSION,
+        "NY": settings.ENABLE_NEWYORK_SESSION,
+        "NY_CLOSE": settings.ENABLE_NEWYORK_SESSION,
+    }
+    enabled = session_map.get(session_name, True)
+    if not enabled:
+        logger.info(f"⛔ SESSION BLOCKED | {session_name} is DISABLED")
+    return enabled
+
+def check_session_limits(session_name: str) -> bool:
+    if not settings.ENABLE_SESSION_LIMITS: return True
+    if session_name not in state.session_trades:
+        state.session_trades[session_name] = 0
+        state.session_start_balance[session_name] = state.balance
+        state.session_peak[session_name] = state.balance
+        state.session_max_dd[session_name] = 0.0
+        logger.info(f"📊 New session: {session_name} | Balance: ${state.balance:.2f}")
+    current = state.session_trades.get(session_name, 0)
+    if current >= settings.MAX_TRADES_PER_SESSION:
+        logger.info(f"⛔ SESSION LIMIT | {session_name}: {current}/{settings.MAX_TRADES_PER_SESSION}")
+        return False
+    state.session_peak[session_name] = max(state.session_peak[session_name], state.balance)
+    session_peak = state.session_peak[session_name]
+    if session_peak > 0:
+        session_dd = ((session_peak - state.balance) / session_peak) * 100
+        state.session_max_dd[session_name] = max(state.session_max_dd.get(session_name, 0), session_dd)
+        if session_dd >= settings.SESSION_MAX_DRAWDOWN_PCT * 100:
+            logger.critical(f"🔒 SESSION DD LIMIT | {session_name}: {session_dd:.2f}%")
+            return False
+    return True
+
+def increment_session_trade(session_name: str):
+    state.session_trades[session_name] = state.session_trades.get(session_name, 0) + 1
+
+def check_news_protection() -> Dict:
+    if not settings.NEWS_PROTECTION: return {"blocked": False}
+    try:
+        return news_mgr.check_news_window(settings.PRE_NEWS_MINUTES, settings.NEWS_FREEZE_MINUTES, state.current_symbol)
+    except:
+        return {"blocked": False}
+
+def get_today_news() -> List[Dict]:
+    if not settings.NEWS_PROTECTION: return []
+    try:
+        events = []
+        if hasattr(news_mgr, 'get_today_events'): events = news_mgr.get_today_events()
+        elif hasattr(news_mgr, '_calendar'): events = news_mgr._calendar
+        elif hasattr(news_mgr, 'calendar'): events = news_mgr.calendar
+        else: return []
+        today = _market_time().strftime('%Y-%m-%d')
+        formatted = []
+        for event in events:
+            event_time = event.get('time') or event.get('datetime') or event.get('date')
+            if not event_time: continue
+            if isinstance(event_time, str):
+                try: event_time = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
+                except ValueError: continue
+            if hasattr(event_time, 'strftime'):
+                if event_time.strftime('%Y-%m-%d') != today: continue
+                sl_time = event_time + timedelta(hours=5, minutes=30)
+                impact = event.get('impact') or event.get('importance', 'Medium')
+                if isinstance(impact, int): impact = 'High' if impact >= 3 else 'Medium' if impact == 2 else 'Low'
+                else: impact = str(impact).capitalize()
+                formatted.append({'title': event.get('title') or event.get('name') or 'Unknown',
+                                  'sl_time': sl_time.strftime('%H:%M'), 'impact': impact,
+                                  'currency': event.get('currency') or event.get('country', 'USD')})
+        formatted.sort(key=lambda x: x['sl_time'])
+        return formatted
+    except Exception as e:
+        logger.error(f"📰 News format error: {e}")
+        return []
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 15: MAIN TRADING LOOP & STARTUP/SHUTDOWN
+# ═══════════════════════════════════════════════════════════════════════
+async def trading_cycle():
+    check_daily_reset()
+    state.mt5_connected = check_mt5_connection()
+    if state.mt5_connected:
+        sync_account_state()
+        sync_open_positions_from_broker()
+    else:
+        state.open_trades.clear()
+        state.active_trade = None
+        state.runner_trade = None
+    if state.auto_trading and not state.mt5_connected:
+        state.auto_trading = False
+        logger.critical("🔒 SAFETY KILL | Auto trading disabled — MT5 connection lost")
+    state.current_symbol = get_symbol_for_datetime(_market_time())
+    update_trading_mode()
+    current_session = detect_session()
+    state.session = current_session.value
+    if not check_session_enabled(current_session.value):
+        return
+    htf_df, itf_df, ltf_df = get_multi_timeframe_data(state.current_symbol)
+    if ltf_df.empty or htf_df.empty:
+        logger.warning("⚠️ Data fetch empty — skipping cycle")
+        return
+    spread_check = check_spread_filter(state.current_symbol, ltf_df)
+    manage_active_trade(ltf_df, htf_df)
+    news_status = check_news_protection()
+    score = evaluate_entry(htf_df, itf_df, ltf_df, settings.ASIAN_AUTO_ELEVATE)
+    dxy_structure = get_dxy_bias()
+    score = apply_dxy_confluence(score, dxy_structure)
+    score = blend_score_with_ml(score, ltf_df)
+    state.last_score = asdict(score)
+    regime = check_market_regime(ltf_df)
+    state.last_score["market_regime"] = regime
+    if not state.auto_trading:
+        return
+    if news_status.get("blocked"):
+        logger.info(f"⛔ NEWS FREEZE | {news_status.get('reason', '')}")
+        return
+    if not spread_check["allowed"]:
+        logger.info(f"⛔ {spread_check['reason']}")
+        return
+    allowed, reason = run_safety_checks(ltf_df)
+    if not allowed:
+        logger.info(f"⛔ SAFETY BLOCK | {reason}")
+        return
+    if state.daily_trades >= settings.MAX_DAILY_TRADES:
+        logger.info(f"⛔ DAILY TRADE LIMIT | {state.daily_trades}/{settings.MAX_DAILY_TRADES}")
+        return
+    if not check_session_limits(current_session.value):
+        return
+    if state.mt5_connected and state.free_margin > 0:
+        min_free = state.balance * float(getattr(settings, 'MIN_FREE_MARGIN_BUFFER_PCT', 0.10))
+        if state.free_margin < min_free:
+            logger.info(f"⛔ FREE MARGIN LOW | free:{state.free_margin:.2f} < required:{min_free:.2f}")
+            return
+    max_positions = get_max_open_positions()
+    open_count = len(state.open_trades)
+    if open_count >= max_positions:
+        scale_plan = check_retreat_reentry(score, ltf_df, htf_df)
+        if scale_plan and scale_plan.valid:
+            if execute_trade_plan(scale_plan, state.current_symbol, MAGIC_SCALE_IN):
+                state.daily_trades += 1
+                increment_session_trade(current_session.value)
+                logger.info(f"🔁 SCALE-IN EXECUTED | {scale_plan.direction} @ {scale_plan.entry:.2f}")
+                await notify(format_entry_alert(scale_plan, state.current_symbol, score, current_session.value))
+        return
+    if score.decision not in ("BUY", "SELL"):
+        return
+    direction = "BUY" if score.decision == "BUY" else "SELL"
+    entry = float(ltf_df['Close'].iloc[-1])
+    sl, tp = calculate_sl_tp(direction, entry, ltf_df, htf_df)
+    if state.mode == "SINGLE_TRADE":
+        tp = 0.0
+    plan = validate_trade(direction, entry, sl, tp, state.balance, state.current_symbol,
+                          allow_no_tp=(state.mode == "SINGLE_TRADE"))
+    if not plan.valid:
+        logger.info(f"⛔ TRADE REJECTED | {plan.reason}")
+        return
+    if regime["size_multiplier"] < 1.0:
+        reduced = plan.position_size * float(regime["size_multiplier"])
+        step = float(get_symbol_specs(state.current_symbol)["lot_step"])
+        plan.position_size = math.floor(reduced / max(step, 1e-8)) * max(step, 1e-8)
+        if plan.position_size <= 0:
+            logger.info("⛔ REGIME SIZE REDUCTION would violate minimum-risk lot; trade rejected")
+            return
+    if state.mode == "SINGLE_TRADE":
+        plan.tp = 0.0
+        magic = MAGIC_SINGLE
+        executed = execute_trade_plan(plan, state.current_symbol, magic)
+    else:
+        specs = get_symbol_specs(state.current_symbol)
+        step = float(specs["lot_step"])
+        half_size = math.floor((plan.position_size / 2) / max(step, 1e-8)) * max(step, 1e-8)
+        if half_size < float(specs["min_lot"]):
+            logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
+            return
+        plan1 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=plan.tp,
+                           position_size=half_size, rr_ratio=plan.rr_ratio,
+                           actual_risk=half_size * abs(plan.entry-plan.sl) * float(specs["contract_size"]))
+        plan2 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=0.0,
+                           position_size=half_size, rr_ratio=plan.rr_ratio,
+                           actual_risk=plan1.actual_risk)
+        executed = execute_trade_plan(plan1, state.current_symbol, MAGIC_SPLIT_1)
+        if executed:
+            runner_executed = execute_trade_plan(plan2, state.current_symbol, MAGIC_SPLIT_2)
+            if not runner_executed:
+                logger.critical("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected")
+            else:
+                state.runner_trade = state.open_trades.get(
+                    next((k for k, v in state.open_trades.items() if v.get("magic") == MAGIC_SPLIT_2), ""))
+        else:
+            executed = False
+    if executed:
+        state.daily_trades += 1
+        increment_session_trade(current_session.value)
+        logger.info(f"🚀 TRADE EXECUTED | {direction} {state.current_symbol} | Mode:{state.mode} | Score L{score.long_score}/S{score.short_score}")
+        await notify(format_entry_alert(plan, state.current_symbol, score, current_session.value))
+
+async def trading_loop():
+    logger.info("🚀 SMC Quant Engine v4.1 — Trading loop started")
+    while state.running:
+        try:
+            await trading_cycle()
+        except Exception as e:
+            logger.error(f"❌ Trading cycle error: {e}", exc_info=True)
+        await asyncio.sleep(getattr(settings, 'LOOP_INTERVAL_SECONDS', 30))
+
+@app.on_event("startup")
+async def on_startup():
+    logger.info("=" * 60)
+    logger.info("🏆 SMC INSTITUTIONAL QUANT ENGINE v4.1 — STARTING")
+    logger.info("=" * 60)
+    try:
+        connected = await asyncio.wait_for(
+            asyncio.to_thread(mt5.connect,
+                getattr(settings, 'EXNESS_ACCOUNT_ID', 0),
+                getattr(settings, 'EXNESS_PASSWORD', ''),
+                getattr(settings, 'EXNESS_SERVER', '')),
+            timeout=10
+        )
+        state.mt5_connected = bool(connected) or check_mt5_connection()
+    except Exception as e:
+        logger.error(f"MT5 connect failed: {e}")
+        state.mt5_connected = False
+    try:
+        broker_balance = mt5.get_balance()
+        if broker_balance is not None:
+            state.balance = float(broker_balance)
+            state.equity = _get_broker_equity(state.balance)
+            state.daily_starting_balance = state.balance
+            state.daily_peak = state.equity
+            state.peak_equity = state.equity
+            state.equity_curve = [state.equity]
+    except Exception as e:
+        logger.warning(f"Balance sync failed: {e}")
+    state.current_symbol = get_symbol_for_datetime(_market_time())
+    update_trading_mode()
+    check_daily_reset()
+    if state.mt5_connected:
+        recover_active_trade_from_mt5()
+    if getattr(settings, 'ENABLE_ML_ENGINE', True) and XGBOOST_AVAILABLE:
+        ml_engine.load(state.current_symbol)
+    try:
+        news_mgr.fetch_calendar()
+    except Exception as e:
+        logger.warning(f"News calendar fetch failed: {e}")
+    async def news_refresh_loop():
+        while state.running:
+            try:
+                news_mgr.fetch_calendar()
+            except Exception:
+                pass
+            await asyncio.sleep(3600)
+    asyncio.create_task(trading_loop())
+    asyncio.create_task(ml_retrain_loop())
+    asyncio.create_task(news_refresh_loop())
+    if getattr(settings, "REQUIRE_WEBHOOK_AUTH", True) and not getattr(settings, "ADMIN_API_KEY", ""):
+        logger.critical("🔐 SECURITY WARNING | REQUIRE_WEBHOOK_AUTH=True but ADMIN_API_KEY is empty; webhook commands are disabled")
+    logger.info(f"✅ STARTUP COMPLETE | MT5:{state.mt5_connected} | Balance:${state.balance:.2f} | Equity:${state.equity:.2f} | Mode:{state.mode}")
+    logger.info("=" * 60)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    state.running = False
+    save_trade_state()
+    save_runtime_state()
+    logger.info("🛑 SMC Quant Engine v4.1 — Shutdown complete, state persisted")
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=getattr(settings, 'HOST', '0.0.0.0'),
+        port=getattr(settings, 'PORT', 8080),
+        reload=False,
+    )
