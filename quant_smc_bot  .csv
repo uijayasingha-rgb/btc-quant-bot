@@ -3489,17 +3489,58 @@ def trading_cycle_sync():
         _publish_state_snapshot()
         return
 
-    direction = "BUY" if score.decision == "BUY" else "SELL"
+        direction = "BUY" if score.decision == "BUY" else "SELL"
     entry = float(ltf_df['Close'].iloc[-1])
     sl, tp = calculate_sl_tp(direction, entry, ltf_df, htf_df)
-if state.mode == "SINGLE_TRADE":
-    plan.tp = 0.0
-    magic = MAGIC_SINGLE
-    executed = execute_trade_plan(plan, state.current_symbol, magic)
-else:
-    specs = get_symbol_specs(state.current_symbol)
-    step = float(specs["lot_step"])
-    half_size = math.floor((plan.position_size / 2) / max(step, 1e-8)) * max(step, 1e-8)
+
+    # ── SINGLE mode ekata TP naa (runner nathuwa) ──
+    if state.mode == "SINGLE_TRADE":
+        tp = 0.0
+
+    # ── Trade plan eka validate karanna ──
+    plan = validate_trade(direction, entry, sl, tp, state.balance, state.current_symbol)
+    if not plan.valid:
+        logger.warning(f"⛔ TRADE REJECTED | {plan.reason}")
+        _publish_state_snapshot()
+        return
+
+    # ── Execute ──
+    executed = False
+    if state.mode == "SINGLE_TRADE":
+        magic = MAGIC_SINGLE
+        executed = execute_trade_plan(plan, state.current_symbol, magic)
+    else:
+        # SPLIT_ENTRY mode
+        specs = get_symbol_specs(state.current_symbol)
+        step = float(specs["lot_step"])
+        half_size = math.floor((plan.position_size / 2) / max(step, 1e-8)) * max(step, 1e-8)
+        
+        if half_size < float(specs["min_lot"]):
+            logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
+            _publish_state_snapshot()
+            return
+
+        plan1 = TradePlan(
+            valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=plan.tp,
+            position_size=half_size, rr_ratio=plan.rr_ratio,
+            actual_risk=half_size * abs(plan.entry - plan.sl) * float(specs["contract_size"])
+        )
+        plan2 = TradePlan(
+            valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=0.0,
+            position_size=half_size, rr_ratio=plan.rr_ratio,
+            actual_risk=plan1.actual_risk
+        )
+
+        executed = execute_trade_plan(plan1, state.current_symbol, MAGIC_SPLIT_1)
+        if executed:
+            runner_executed = execute_trade_plan(plan2, state.current_symbol, MAGIC_SPLIT_2)
+            if not runner_executed:
+                logger.warning("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected.")
+                notify_from_trading_thread("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected.")
+            else:
+                state.runner_trade = state.open_trades.get(
+                    next((k for k, v in state.open_trades.items() if v.get("magic") == MAGIC_SPLIT_2), ""))
+
     if half_size < float(specs["min_lot"]):
         logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
         _publish_state_snapshot()
