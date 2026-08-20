@@ -3729,62 +3729,19 @@ async def on_shutdown():
     _trading_cmd_queue.put({"action": "shutdown"})
     # Give trading thread time to save state gracefully
     await asyncio.sleep(3)
-    logger.info("🛑 SMC Quant Engine v4.1 — Shutdown complete")
-    try:
-        connected = await asyncio.wait_for(
-            asyncio.to_thread(mt5.connect,
-                getattr(settings, 'EXNESS_ACCOUNT_ID', 0),
-                getattr(settings, 'EXNESS_PASSWORD', ''),
-                getattr(settings, 'EXNESS_SERVER', '')),
-            timeout=10
-        )
-        state.mt5_connected = bool(connected) or check_mt5_connection()
-    except Exception as e:
-        logger.error(f"MT5 connect failed: {e}")
-        state.mt5_connected = False
-    try:
-        broker_balance = mt5.get_balance()
-        if broker_balance is not None:
-            state.balance = float(broker_balance)
-            state.equity = _get_broker_equity(state.balance)
-            state.daily_starting_balance = state.balance
-            state.daily_peak = state.equity
-            state.peak_equity = state.equity
-            state.equity_curve = [state.equity]
-    except Exception as e:
-        logger.warning(f"Balance sync failed: {e}")
-    state.current_symbol = get_symbol_for_datetime(_market_time())
-    update_trading_mode()
-    check_daily_reset()
-    if state.mt5_connected:
-        recover_active_trade_from_mt5()
-    if getattr(settings, 'ENABLE_ML_ENGINE', True) and XGBOOST_AVAILABLE:
-        ml_engine.load(state.current_symbol)
-    try:
-        news_mgr.fetch_calendar()
-    except Exception as e:
-        logger.warning(f"News calendar fetch failed: {e}")
-    async def news_refresh_loop():
-        while state.running:
-            try:
-                news_mgr.fetch_calendar()
-            except Exception:
-                pass
-            await asyncio.sleep(3600)
-    asyncio.create_task(trading_loop())
-    asyncio.create_task(ml_retrain_loop())
-    asyncio.create_task(news_refresh_loop())
-    if getattr(settings, "REQUIRE_WEBHOOK_AUTH", True) and not getattr(settings, "ADMIN_API_KEY", ""):
-        logger.critical("🔐 SECURITY WARNING | REQUIRE_WEBHOOK_AUTH=True but ADMIN_API_KEY is empty; webhook commands are disabled")
-    logger.info(f"✅ STARTUP COMPLETE | MT5:{state.mt5_connected} | Balance:${state.balance:.2f} | Equity:${state.equity:.2f} | Mode:{state.mode}")
-    logger.info("=" * 60)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    state.running = False
     save_trade_state()
     save_runtime_state()
     logger.info("🛑 SMC Quant Engine v4.1 — Shutdown complete, state persisted")
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=getattr(settings, 'HOST', '0.0.0.0'),
+        port=getattr(settings, 'PORT', 8080),
+        reload=False,
+    )
+
 
 if __name__ == "__main__":
     uvicorn.run(
