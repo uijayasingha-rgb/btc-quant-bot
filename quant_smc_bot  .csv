@@ -141,9 +141,7 @@ try:
     from mt5.connector import MT5Connector
     mt5 = MT5Connector()
 except ImportError as e:
-    print(f"❌ CRITICAL: mt5.connector module not found: {e}")
-    print("🔒 Exiting because real MT5 connector is required.")
-    raise SystemExit(1)
+    class _FakeMT5:
         def connect(self, *a, **k): return False
         def get_balance(self): return 15.0
         def fetch_rates(self, *a, **k): return pd.DataFrame()
@@ -155,6 +153,7 @@ except ImportError as e:
         def terminal_info(self): return {"connected": False}
         def get_symbol_info(self, *a, **k): return None
         def get_spread(self, *a, **k): return 0.0
+    print(f"⚠️ MT5 connector not available; using safe fallback ({e}).")
     mt5 = _FakeMT5()
 
 try:
@@ -750,24 +749,24 @@ df['vwap_upper_1'] = df['vwap'] + df['vwap_std']
 df['vwap_lower_1'] = df['vwap'] - df['vwap_std']
 df['vwap_upper_2'] = df['vwap'] + 2 * df['vwap_std']
 df['vwap_lower_2'] = df['vwap'] - 2 * df['vwap_std']
-    pd_window = 30
-    df['range_high'] = df['High'].rolling(pd_window).max()
-    df['range_low'] = df['Low'].rolling(pd_window).min()
-    df['price_range'] = (df['range_high'] - df['range_low']).clip(lower=1e-8)
-    df['pd_zone'] = (df['Close'] - df['range_low']) / df['price_range']
-    df['zone_premium'] = df['pd_zone'] > 0.70
-    df['zone_discount'] = df['pd_zone'] < 0.30
-    df['zone_equilibrium'] = (df['pd_zone'] >= 0.30) & (df['pd_zone'] <= 0.70)
-    df['atr'] = df['candle_range'].rolling(14).mean()
-    df['atr_pctile'] = df['atr'].rolling(100).rank(pct=True).fillna(0.5)
-    df['volatility_squeeze'] = (df['atr_pctile'] < 0.20).astype(int)
-    df['ema20'] = df['Close'].ewm(span=20).mean()
-    df['ema50'] = df['Close'].ewm(span=50).mean()
-    df['liquidity_pool_high'] = df['High'].rolling(20).max()
-    df['liquidity_pool_low'] = df['Low'].rolling(20).min()
-    df['near_pool_high'] = (df['High'] >= df['liquidity_pool_high'] * 0.999).astype(int)
-    df['near_pool_low'] = (df['Low'] <= df['liquidity_pool_low'] * 1.001).astype(int)
-    return df
+pd_window = 30
+df['range_high'] = df['High'].rolling(pd_window).max()
+df['range_low'] = df['Low'].rolling(pd_window).min()
+df['price_range'] = (df['range_high'] - df['range_low']).clip(lower=1e-8)
+df['pd_zone'] = (df['Close'] - df['range_low']) / df['price_range']
+df['zone_premium'] = df['pd_zone'] > 0.70
+df['zone_discount'] = df['pd_zone'] < 0.30
+df['zone_equilibrium'] = (df['pd_zone'] >= 0.30) & (df['pd_zone'] <= 0.70)
+df['atr'] = df['candle_range'].rolling(14).mean()
+df['atr_pctile'] = df['atr'].rolling(100).rank(pct=True).fillna(0.5)
+df['volatility_squeeze'] = (df['atr_pctile'] < 0.20).astype(int)
+df['ema20'] = df['Close'].ewm(span=20).mean()
+df['ema50'] = df['Close'].ewm(span=50).mean()
+df['liquidity_pool_high'] = df['High'].rolling(20).max()
+df['liquidity_pool_low'] = df['Low'].rolling(20).min()
+df['near_pool_high'] = (df['High'] >= df['liquidity_pool_high'] * 0.999).astype(int)
+df['near_pool_low'] = (df['Low'] <= df['liquidity_pool_low'] * 1.001).astype(int)
+return df
 
 # ═══════════════════════════════════════════════════════════════════════
 # PHASE 11A: 5M SWING + ZONE + LIQUIDITY FOUNDATION
@@ -981,63 +980,63 @@ def build_swing_candidates(df: pd.DataFrame, left: int = 3, right: int = 3,
     except Exception:
         pools = {'eqh': [], 'eql': []}
 
-  candidates: List[SwingCandidate] = []
-  for i in range(left, len(marked) - right):
-      swing_type = None
-      if bool(marked['swing_low'].iloc[i]):
-          swing_type = SwingType.LOW
-      elif bool(marked['swing_high'].iloc[i]):
-          swing_type = SwingType.HIGH
-      if swing_type is None:
-          continue
+    candidates: List[SwingCandidate] = []
+    for i in range(left, len(marked) - right):
+        swing_type = None
+        if bool(marked['swing_low'].iloc[i]):
+            swing_type = SwingType.LOW
+        elif bool(marked['swing_high'].iloc[i]):
+            swing_type = SwingType.HIGH
+        if swing_type is None:
+            continue
 
-      price = _safe_float(marked['Low'].iloc[i] if swing_type == SwingType.LOW else marked['High'].iloc[i])
-      atr = _rolling_atr_at(marked, i)
-      swing_id = f"{swing_type.value}_{i}_{price:.8f}"
-      zone = _build_swing_zone(marked, i, swing_type, swing_id)
-      liquidity, source = _nearest_liquidity_level(price, swing_type, pools, atr)
+        price = _safe_float(marked['Low'].iloc[i] if swing_type == SwingType.LOW else marked['High'].iloc[i])
+        atr = _rolling_atr_at(marked, i)
+        swing_id = f"{swing_type.value}_{i}_{price:.8f}"
+        zone = _build_swing_zone(marked, i, swing_type, swing_id)
+        liquidity, source = _nearest_liquidity_level(price, swing_type, pools, atr)
 
-      candle_range = max(_safe_float(marked['High'].iloc[i]) - _safe_float(marked['Low'].iloc[i]), 0.0)
-      body = abs(_safe_float(marked['Close'].iloc[i]) - _safe_float(marked['Open'].iloc[i]))
+        candle_range = max(_safe_float(marked['High'].iloc[i]) - _safe_float(marked['Low'].iloc[i]), 0.0)
+        body = abs(_safe_float(marked['Close'].iloc[i]) - _safe_float(marked['Open'].iloc[i]))
 
-      if swing_type == SwingType.HIGH:
-          wick = max(
-              _safe_float(marked['High'].iloc[i]) -
-              max(_safe_float(marked['Open'].iloc[i]), _safe_float(marked['Close'].iloc[i])),
-              0.0
-          )
-      else:
-          wick = max(
-              min(_safe_float(marked['Open'].iloc[i]), _safe_float(marked['Close'].iloc[i])) -
-              _safe_float(marked['Low'].iloc[i]),
-              0.0
-          )
+        if swing_type == SwingType.HIGH:
+            wick = max(
+                _safe_float(marked['High'].iloc[i]) -
+                max(_safe_float(marked['Open'].iloc[i]), _safe_float(marked['Close'].iloc[i])),
+                0.0
+            )
+        else:
+            wick = max(
+                min(_safe_float(marked['Open'].iloc[i]), _safe_float(marked['Close'].iloc[i])) -
+                _safe_float(marked['Low'].iloc[i]),
+                0.0
+            )
 
-      normalized = candle_range / atr if atr > 0 else 0.0
+        normalized = candle_range / atr if atr > 0 else 0.0
 
-      candidates.append(SwingCandidate(
-          id=swing_id,
-          type=swing_type,
-          price=price,
-          index=i,
-          timestamp=_bar_timestamp(marked, i),
-          strength=_swing_strength(marked, i, swing_type, left, right),
-          left_bars=left,
-          right_bars=right,
-          zone_high=zone.high,
-          zone_low=zone.low,
-          wick_size=round(wick, 8),
-          body_size=round(body, 8),
-          candle_range=round(candle_range, 8),
-          atr=round(atr, 8),
-          atr_normalized_size=round(normalized, 4),
-          liquidity_level=liquidity,
-          liquidity_source=source,
-          status=SwingStatus.CANDIDATE,
-          created_bar=i,
-          expires_bar=i + max(int(expiry_bars), 1),
-      ))
-  return candidates
+        candidates.append(SwingCandidate(
+            id=swing_id,
+            type=swing_type,
+            price=price,
+            index=i,
+            timestamp=_bar_timestamp(marked, i),
+            strength=_swing_strength(marked, i, swing_type, left, right),
+            left_bars=left,
+            right_bars=right,
+            zone_high=zone.high,
+            zone_low=zone.low,
+            wick_size=round(wick, 8),
+            body_size=round(body, 8),
+            candle_range=round(candle_range, 8),
+            atr=round(atr, 8),
+            atr_normalized_size=round(normalized, 4),
+            liquidity_level=liquidity,
+            liquidity_source=source,
+            status=SwingStatus.CANDIDATE,
+            created_bar=i,
+            expires_bar=i + max(int(expiry_bars), 1),
+        ))
+    return candidates
 
 
 def detect_liquidity_interaction(df: pd.DataFrame, candidate: SwingCandidate,
@@ -2435,35 +2434,40 @@ def _manage_one_trade(trade: Dict, ltf_df: pd.DataFrame, htf_df: pd.DataFrame):
     apply_breakeven(trade, current_r)
     apply_trailing_stop(trade, ltf_df, current_r)
 
-def manage_active_trade():
+def manage_active_trade(symbol: Optional[str] = None, ltf_df: Optional[pd.DataFrame] = None,
+                       htf_df: Optional[pd.DataFrame] = None):
     """Manage all open trades, fetching LTF/HTF data per symbol."""
+    if symbol is None:
+        symbol = state.current_symbol
+
     if not state.open_trades and state.active_trade:
         state.open_trades[str(state.active_trade["ticket"])] = state.active_trade
 
-    # Group open trades by symbol
     trades_by_symbol: Dict[str, List[Dict]] = {}
     for trade in state.open_trades.values():
-        symbol = trade.get("symbol", state.current_symbol)
-        trades_by_symbol.setdefault(symbol, []).append(trade)
+        trade_symbol = trade.get("symbol", state.current_symbol)
+        trades_by_symbol.setdefault(trade_symbol, []).append(trade)
 
-    for symbol, trades in trades_by_symbol.items():
+    for trade_symbol, trades in trades_by_symbol.items():
         if not trades:
             continue
 
-        # Fetch data for this specific symbol
-        htf_df, itf_df, ltf_df = get_multi_timeframe_data(symbol)
-        if ltf_df.empty or htf_df.empty:
-            logger.warning(f"⚠️ Data empty for {symbol}; skip managing {len(trades)} trades")
+        if ltf_df is None or htf_df is None or trade_symbol != symbol:
+            htf_df_local, itf_df_local, ltf_df_local = get_multi_timeframe_data(trade_symbol)
+        else:
+            htf_df_local, itf_df_local, ltf_df_local = htf_df, None, ltf_df
+
+        if ltf_df_local.empty or htf_df_local.empty:
+            logger.warning(f"⚠️ Data empty for {trade_symbol}; skip managing {len(trades)} trades")
             continue
 
         for trade in trades:
             if _position_exists(int(trade["ticket"])):
-                _manage_one_trade(trade, ltf_df, htf_df)
+                _manage_one_trade(trade, ltf_df_local, htf_df_local)
             else:
-                # Broker closed position
                 logger.warning(f"♻️ BROKER CLOSED POSITION DETECTED | ticket:{trade['ticket']}")
                 closed_records = fetch_mt5_history_deals(
-                    symbol=symbol,
+                    symbol=trade_symbol,
                     since=datetime.now() - timedelta(days=1)
                 )
                 found = None
@@ -3426,7 +3430,7 @@ def trading_cycle_sync():
         return
 
     spread_check = check_spread_filter(state.current_symbol, ltf_df)
-    manage_active_trade(ltf_df, htf_df)
+    manage_active_trade(state.current_symbol, ltf_df, htf_df)
     news_status = check_news_protection()
     score = evaluate_entry(htf_df, itf_df, ltf_df, settings.ASIAN_AUTO_ELEVATE)
     dxy_structure = get_dxy_bias()
@@ -3489,32 +3493,28 @@ def trading_cycle_sync():
         _publish_state_snapshot()
         return
 
-        direction = "BUY" if score.decision == "BUY" else "SELL"
+    direction = "BUY" if score.decision == "BUY" else "SELL"
     entry = float(ltf_df['Close'].iloc[-1])
     sl, tp = calculate_sl_tp(direction, entry, ltf_df, htf_df)
 
-    # ── SINGLE mode ekata TP naa (runner nathuwa) ──
     if state.mode == "SINGLE_TRADE":
         tp = 0.0
 
-    # ── Trade plan eka validate karanna ──
     plan = validate_trade(direction, entry, sl, tp, state.balance, state.current_symbol)
     if not plan.valid:
         logger.warning(f"⛔ TRADE REJECTED | {plan.reason}")
         _publish_state_snapshot()
         return
 
-    # ── Execute ──
     executed = False
     if state.mode == "SINGLE_TRADE":
         magic = MAGIC_SINGLE
         executed = execute_trade_plan(plan, state.current_symbol, magic)
     else:
-        # SPLIT_ENTRY mode
         specs = get_symbol_specs(state.current_symbol)
         step = float(specs["lot_step"])
         half_size = math.floor((plan.position_size / 2) / max(step, 1e-8)) * max(step, 1e-8)
-        
+
         if half_size < float(specs["min_lot"]):
             logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
             _publish_state_snapshot()
@@ -3540,33 +3540,6 @@ def trading_cycle_sync():
             else:
                 state.runner_trade = state.open_trades.get(
                     next((k for k, v in state.open_trades.items() if v.get("magic") == MAGIC_SPLIT_2), ""))
-
-    if half_size < float(specs["min_lot"]):
-        logger.info("⛔ SPLIT ENTRY REJECTED | Position too small for two risk-valid broker lots")
-        _publish_state_snapshot()
-        return
-
-    plan1 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=plan.tp,
-                       position_size=half_size, rr_ratio=plan.rr_ratio,
-                       actual_risk=half_size * abs(plan.entry-plan.sl) * float(specs["contract_size"]))
-    plan2 = TradePlan(valid=True, direction=direction, entry=plan.entry, sl=plan.sl, tp=0.0,
-                       position_size=half_size, rr_ratio=plan.rr_ratio,
-                       actual_risk=plan1.actual_risk)
-
-    executed = execute_trade_plan(plan1, state.current_symbol, MAGIC_SPLIT_1)
-    if executed:
-        runner_executed = execute_trade_plan(plan2, state.current_symbol, MAGIC_SPLIT_2)
-        if not runner_executed:
-            # Partial execution: fixed leg open, runner rejected
-            logger.warning("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected. Managing fixed leg as standalone trade.")
-            notify_from_trading_thread("⚠️ SPLIT PARTIAL EXECUTION | Fixed leg opened, runner rejected.")
-            # Actual risk already recorded as half_size (plan1.actual_risk)
-            # No runner_trade; scale-in/retreat logic will be disabled because state.runner_trade remains None
-        else:
-            state.runner_trade = state.open_trades.get(
-                next((k for k, v in state.open_trades.items() if v.get("magic") == MAGIC_SPLIT_2), ""))
-    else:
-        executed = False
 
     if executed:
         state.daily_trades += 1
@@ -3735,18 +3708,4 @@ async def on_shutdown():
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=getattr(settings, 'HOST', '0.0.0.0'),
-        port=getattr(settings, 'PORT', 8080),
-        reload=False,
-    )
-
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=getattr(settings, 'HOST', '0.0.0.0'),
-        port=getattr(settings, 'PORT', 8080),
-        reload=False,
-    )
+    uvicorn.run(app, host=getattr(settings, 'HOST', '0.0.0.0'), port=getattr(settings, 'PORT', 8080), reload=False)
